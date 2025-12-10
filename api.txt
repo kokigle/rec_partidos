@@ -1,0 +1,2 @@
+API_LOGIN = "c63384b752fc0304b170"
+API_KEY = "6BeDd4Wbayu9yMo"
