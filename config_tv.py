@@ -28,7 +28,6 @@ GRILLA_CANALES = {
 
     "TyC Sports": [
         ("Angulismo_TYC_SPORTS", "https://angulismotv.pages.dev/transmision?channel=TyC+Sports&opt=0"),
-        ("Libre_TYC_SPORTS", "https://librefutbol.pe/en-vivo/tyc-sports"),
         ("FutbolARG_TYC_SPORTS", "https://www.futbolarg.tv/tyc-sports-en-vivo.php"),
     ],
     "Fox Sports": [
