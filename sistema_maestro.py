@@ -11,482 +11,350 @@ import promiedos_client
 import smart_selector
 import uploader
 
-# ================= CONFIGURACIÓN MEJORADA =================
+# ================= CONFIGURACIÓN "ULTRA-ROBUSTA" =================
 CARPETA_LOCAL = "./partidos_grabados"
 CARPETA_LOGS = "./logs"
-MARGEN_SEGURIDAD = 90
-MINUTOS_PREVIA = 5
-MINUTOS_PREBUSQUEDA = 15  # Buscar streams 15 min antes
-TIMEOUT_ENTRETIEMPO = 1200  # 20 min
-MAX_REINTENTOS_STREAM = 3
-INTERVALO_REFRESCO_ESTADO = 30  # Consultar estado cada 30s (aumentado)
-INTERVALO_CHECK_SALUD = 90  # Verificar salud de grabación cada 90s
-# ==========================================================
+CARPETA_TEMP = "./temp_segments"
 
-# Cache global de streams encontrados
+# --- TIEMPOS Y TIMEOUTS ---
+MARGEN_SEGURIDAD = 90           
+MINUTOS_PREVIA = 500000000
+MINUTOS_PREBUSQUEDA = 15        
+TIMEOUT_ENTRETIEMPO = 1800      
+MAX_REINTENTOS_STREAM = 5       
+
+# --- MONITOREO ---
+INTERVALO_HEALTH_CHECK = 5      
+INTERVALO_VALIDACION_CONTENIDO = 8  
+INTERVALO_REFRESCO_ESTADO = 10  
+
+# --- REDUNDANCIA ---
+MAX_STREAMS_PARALELOS = 2       
+THRESHOLD_TAMAÑO_CORTE = 512 * 1024  
+
+# --- ENTRETIEMPO INTELIGENTE ---
+MINUTOS_ESPERA_BUSQUEDA_2T = 3  
+MINUTOS_FORCE_START_2T = 14     
+
+# --- PRIORIDAD ---
+PRIORIDAD_CANALES = ["ESPN Premium", "TNT Sports", "Fox Sports", "ESPN", "ESPN 2", "TyC Sports"]
+# =================================================================
+
 cache_streams = {}
 lock_cache = threading.Lock()
+procesos_activos = {}
+lock_procesos = threading.Lock()
 
 def setup_directorios():
-    """Crea directorios necesarios"""
-    for carpeta in [CARPETA_LOCAL, CARPETA_LOGS]:
+    for carpeta in [CARPETA_LOCAL, CARPETA_LOGS, CARPETA_TEMP]:
         os.makedirs(carpeta, exist_ok=True)
 
 def log_partido(nombre_archivo, mensaje):
-    """Logger específico por partido"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     log_msg = f"[{timestamp}] {mensaje}"
     print(log_msg)
-    
-    with open(f"{CARPETA_LOGS}/{nombre_archivo}.log", "a") as f:
+    with open(f"{CARPETA_LOGS}/{nombre_archivo}.log", "a", encoding='utf-8') as f:
         f.write(log_msg + "\n")
 
-def iniciar_grabacion_ffmpeg(stream_obj, ruta_salida, nombre_partido):
-    """Grabación con manejo de errores mejorado"""
-    log_partido(nombre_partido, f"🎥 Iniciando grabación: {os.path.basename(ruta_salida)}")
+# ================= LÓGICA DE CANALES =================
+def seleccionar_canal_unico(canales_partido):
+    if not canales_partido: return None, []
+    print(f"📺 Canales disponibles: {', '.join(canales_partido)}")
+    
+    for canal_prioritario in PRIORIDAD_CANALES:
+        for canal_disponible in canales_partido:
+            if canal_prioritario.lower() in canal_disponible.lower():
+                fuentes = resolver_fuentes_especificas(canal_disponible)
+                if fuentes:
+                    print(f"✅ CANAL ELEGIDO: {canal_disponible} ({len(fuentes)} fuentes)")
+                    return canal_disponible, fuentes
+    
+    for canal_disponible in canales_partido:
+        fuentes = resolver_fuentes_especificas(canal_disponible)
+        if fuentes:
+            print(f"✅ CANAL ELEGIDO (Fallback): {canal_disponible}")
+            return canal_disponible, fuentes
+    return None, []
+
+def resolver_fuentes_especificas(nombre_canal):
+    fuentes = []
+    for key, links in GRILLA_CANALES.items():
+        if key.lower() in nombre_canal.lower() or nombre_canal.lower() in key.lower():
+            fuentes.extend(links)
+    return fuentes
+
+# ================= UTILIDADES =================
+def obtener_tamanio_archivo(ruta):
+    try: return os.path.getsize(ruta)
+    except: return 0
+
+# ================= MOTOR DE GRABACIÓN =================
+def iniciar_grabacion_ffmpeg(stream_obj, ruta_salida, nombre_partido, sufijo=""):
+    log_partido(nombre_partido, f"🎥 Iniciando REC{sufijo}: {os.path.basename(ruta_salida)}")
     log_partido(nombre_partido, f"   Stream: {stream_obj.fuente} (Delay: {stream_obj.delay:.1f}s)")
     
     cmd = [
         "yt-dlp", stream_obj.url,
         "-o", ruta_salida,
-        "--hls-prefer-native",
+        "--hls-prefer-native", "--live-from-start",
+        "--concurrent-fragments", "10", "--buffer-size", "256K", "--http-chunk-size", "10M",
         "--add-header", f"Referer:{stream_obj.referer}",
         "--add-header", f"User-Agent:{stream_obj.ua}",
-        "--no-warnings",
-        "--retries", "15",
-        "--fragment-retries", "15",
-        "--concurrent-fragments", "3",
-        "--buffer-size", "32K",
-        "--http-chunk-size", "1M"
+        "--socket-timeout", "30", "--no-warnings", "--quiet",
+        "--retries", "20", "--fragment-retries", "20", "--ignore-errors", "--no-abort-on-error"
     ]
     
     try:
-        proceso = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
+        proceso = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return proceso
     except Exception as e:
-        log_partido(nombre_partido, f"❌ Error iniciando ffmpeg: {e}")
+        log_partido(nombre_partido, f"❌ Error lanzando yt-dlp: {e}")
         return None
 
-def verificar_grabacion_activa(proceso, nombre_partido):
-    """Verifica que la grabación esté funcionando"""
-    if not proceso or proceso.poll() is not None:
-        log_partido(nombre_partido, "⚠️ Proceso de grabación no está activo")
-        return False
-    return True
-
-def detener_grabacion(proceso, nombre_partido, descripcion=""):
-    """Detención segura con timeout"""
+def detener_grabacion_suave(proceso, nombre_partido, etiqueta=""):
     if proceso and proceso.poll() is None:
-        log_partido(nombre_partido, f"🛑 Deteniendo grabación {descripcion}...")
-        
+        log_partido(nombre_partido, f"🛑 Deteniendo {etiqueta}...")
         try:
             proceso.send_signal(signal.SIGINT)
             proceso.wait(timeout=20)
-            log_partido(nombre_partido, "✅ Grabación finalizada correctamente")
         except subprocess.TimeoutExpired:
-            log_partido(nombre_partido, "⚠️ Timeout en cierre, forzando...")
+            log_partido(nombre_partido, "⚠️ Timeout stop, forzando kill...")
             proceso.kill()
-            proceso.wait()
-        except Exception as e:
-            log_partido(nombre_partido, f"⚠️ Error deteniendo: {e}")
-            try:
-                proceso.kill()
-            except:
-                pass
 
-def unir_videos(v1, v2, salida, nombre_partido):
-    """Unión de videos con validación"""
-    log_partido(nombre_partido, "🎬 Uniendo partes del partido...")
+# ================= GRABACIÓN RESILIENTE =================
+def grabar_fase_con_redundancia(fuentes_canal, ruta_base, nombre_partido, fase, 
+                              url_promiedos, estados_fin, canal_nombre, streams_precargados=None):
+    log_partido(nombre_partido, f"🚀 INICIANDO {fase} (Modo Redundante - Canal: {canal_nombre})")
     
-    # Verificar que existan ambos archivos
-    if not os.path.exists(v1):
-        log_partido(nombre_partido, f"⚠️ No existe {v1}, usando solo 2T")
-        if os.path.exists(v2):
-            os.rename(v2, salida)
-        return False
+    procesos = []
+    cambios_stream = 0
+    candidatos = []
+
+    # 1. SELECCIÓN DE STREAMS (USAR PRECARGADOS SI EXISTEN)
+    if streams_precargados and len(streams_precargados) > 0:
+        log_partido(nombre_partido, f"📦 Usando {len(streams_precargados)} streams ya escaneados anteriormente")
+        candidatos = streams_precargados
+    else:
+        log_partido(nombre_partido, "🔍 Buscando streams frescos...")
+        candidatos = smart_selector.obtener_mejores_streams(fuentes_canal)
     
-    if not os.path.exists(v2):
-        log_partido(nombre_partido, f"⚠️ No existe {v2}, usando solo 1T")
-        os.rename(v1, salida)
-        return False
+    # Filtrar duplicados por URL
+    urls_usadas = set()
+    streams_unicos = []
+    for s in candidatos:
+        if s.url not in urls_usadas:
+            streams_unicos.append(s)
+            urls_usadas.add(s.url)
     
-    lista = f"{salida}.txt"
-    try:
+    if not streams_unicos:
+        log_partido(nombre_partido, f"❌ No hay streams iniciales para {canal_nombre} (Reintentando escaneo profundo...)")
+        # Último intento si falló lo precargado
+        candidatos = smart_selector.obtener_mejores_streams(fuentes_canal)
+        streams_unicos = [s for s in candidatos if s.url not in urls_usadas]
+
+    # Iniciar procesos (Top N streams)
+    max_streams = min(len(streams_unicos), MAX_STREAMS_PARALELOS)
+    for i in range(max_streams):
+        stream = streams_unicos[i]
+        ruta = f"{ruta_base}_p{cambios_stream}_s{i}.mp4"
+        p = iniciar_grabacion_ffmpeg(stream, ruta, nombre_partido, f" [S{i}]")
+        if p:
+            procesos.append({
+                "proc": p, "ruta": ruta, "stream": stream, 
+                "idx": i, "estado": "ok", "last_check": time.time(), "last_size": 0
+            })
+
+    # 2. BUCLE DE MONITOREO
+    while True:
+        time.sleep(INTERVALO_HEALTH_CHECK)
+        
+        # A) Fin de fase
+        estado_actual = promiedos_client.obtener_estado_partido(url_promiedos)
+        if estado_actual in estados_fin or estado_actual == "FINAL":
+            log_partido(nombre_partido, f"🏁 Fin de fase detectado: {estado_actual}")
+            break
+            
+        # B) Health Check
+        procesos_vivos = 0
+        now = time.time()
+        
+        for p_obj in procesos:
+            if p_obj["estado"] == "dead": continue
+            
+            if p_obj["proc"].poll() is not None:
+                log_partido(nombre_partido, f"⚠️ Stream {p_obj['idx']} murió (proceso cerrado)")
+                p_obj["estado"] = "dead"
+                continue
+                
+            if now - p_obj["last_check"] > INTERVALO_VALIDACION_CONTENIDO:
+                size_now = obtener_tamanio_archivo(p_obj["ruta"])
+                if size_now <= p_obj["last_size"] and size_now > THRESHOLD_TAMAÑO_CORTE:
+                    log_partido(nombre_partido, f"⚠️ Stream {p_obj['idx']} congelado")
+                    detener_grabacion_suave(p_obj["proc"], nombre_partido, "congelado")
+                    p_obj["estado"] = "dead"
+                    continue
+                p_obj["last_size"] = size_now
+                p_obj["last_check"] = now
+            
+            procesos_vivos += 1
+            
+        # C) Rescate
+        if procesos_vivos == 0:
+            log_partido(nombre_partido, "🚨 TODOS LOS STREAMS CAÍDOS - Iniciando rescate...")
+            cambios_stream += 1
+            
+            # Buscar stream fresco (aquí sí escaneamos de nuevo porque todo falló)
+            nuevos = smart_selector.obtener_mejores_streams(fuentes_canal)
+            if nuevos:
+                nuevo_s = nuevos[0]
+                ruta_res = f"{ruta_base}_rescue{cambios_stream}.mp4"
+                proc_res = iniciar_grabacion_ffmpeg(nuevo_s, ruta_res, nombre_partido, " [RESCUE]")
+                if proc_res:
+                    procesos.append({
+                        "proc": proc_res, "ruta": ruta_res, "stream": nuevo_s,
+                        "idx": 99, "estado": "ok", "last_check": now, "last_size": 0
+                    })
+            else:
+                log_partido(nombre_partido, "❌ Falló rescate: No hay streams disponibles")
+                time.sleep(5)
+
+    time.sleep(60) # Buffer final
+    for p_obj in procesos:
+        if p_obj["estado"] == "ok":
+            detener_grabacion_suave(p_obj["proc"], nombre_partido, "final fase")
+            
+    rutas_validas = [p["ruta"] for p in procesos if obtener_tamanio_archivo(p["ruta"]) > THRESHOLD_TAMAÑO_CORTE]
+    return rutas_validas
+
+# ================= UNIÓN Y POST-PRODUCCIÓN =================
+def seleccionar_mejor_video(rutas, nombre_partido):
+    if not rutas: return None
+    mejor = max(rutas, key=lambda r: obtener_tamanio_archivo(r))
+    log_partido(nombre_partido, f"🏆 Mejor segmento: {os.path.basename(mejor)} ({obtener_tamanio_archivo(mejor)/1024/1024:.1f} MB)")
+    for r in rutas:
+        if r != mejor:
+            try: os.remove(r)
+            except: pass
+    return mejor
+
+def unir_videos_final(rutas_1t, rutas_2t, salida, nombre_partido):
+    v1 = seleccionar_mejor_video(rutas_1t, nombre_partido)
+    v2 = seleccionar_mejor_video(rutas_2t, nombre_partido)
+    
+    if not v1 and not v2: return False
+    
+    log_partido(nombre_partido, "🎬 Generando video final...")
+    
+    if v1 and v2:
+        lista = f"{CARPETA_TEMP}/{nombre_partido}_list.txt"
         with open(lista, "w") as f:
             f.write(f"file '{os.path.abspath(v1)}'\nfile '{os.path.abspath(v2)}'\n")
+        subprocess.run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", lista, "-c", "copy", "-y", salida],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(lista)
+        os.remove(v1)
+        os.remove(v2)
+    elif v1: os.rename(v1, salida)
+    elif v2: os.rename(v2, salida)
         
-        resultado = subprocess.run(
-            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", lista, "-c", "copy", "-y", salida],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=300
+    return os.path.exists(salida)
+
+# ================= GESTOR PRINCIPAL =================
+def gestionar_partido(url_promiedos, nombre_archivo, hora_inicio):
+    log_partido(nombre_archivo, f"📅 GESTIONANDO: {nombre_archivo}")
+    
+    meta = promiedos_client.obtener_metadata_partido(url_promiedos)
+    if not meta: return
+    
+    canal_nombre, fuentes_canal = seleccionar_canal_unico(meta['canales'])
+    if not canal_nombre:
+        log_partido(nombre_archivo, "❌ Sin canal compatible disponible")
+        return
+
+    ahora = datetime.now()
+    h_match = datetime.strptime(hora_inicio, "%H:%M").replace(year=ahora.year, month=ahora.month, day=ahora.day)
+    if h_match < ahora - timedelta(hours=4): h_match += timedelta(days=1)
+    
+    # 1. PRE-CALENTAMIENTO Y BÚSQUEDA
+    sec_wait = 0 #(h_match - timedelta(minutes=MINUTOS_PREBUSQUEDA) - datetime.now()).total_seconds()
+    if sec_wait > 0:
+        log_partido(nombre_archivo, f"⏳ Esperando {int(sec_wait/60)}m para pre-búsqueda...")
+        time.sleep(sec_wait)
+        
+    log_partido(nombre_archivo, "⚡ Pre-calentando y guardando streams...")
+    # AQUÍ ESTÁ EL CAMBIO: Guardamos el resultado en una variable
+    streams_precargados_1t = smart_selector.obtener_mejores_streams(fuentes_canal)
+    
+    # 2. ESPERA FINAL
+    sec_wait_rec = (h_match - timedelta(minutes=MINUTOS_PREVIA) - datetime.now()).total_seconds()
+    if sec_wait_rec > 0: time.sleep(sec_wait_rec)
+    
+    ruta_base_1t = f"{CARPETA_LOCAL}/{nombre_archivo}_1T"
+    ruta_base_2t = f"{CARPETA_LOCAL}/{nombre_archivo}_2T"
+    ruta_final = f"{CARPETA_LOCAL}/{nombre_archivo}_FULL.mp4"
+    
+    rutas_gen_1t = []
+    rutas_gen_2t = []
+    streams_precargados_2t = None
+    
+    # 3. FASE 1T
+    estado = promiedos_client.obtener_estado_partido(url_promiedos)
+    if estado in ["PREVIA", "JUGANDO_1T"]:
+        # AQUÍ ESTÁ EL CAMBIO: Pasamos la variable a la función
+        rutas_gen_1t = grabar_fase_con_redundancia(
+            fuentes_canal, ruta_base_1t, nombre_archivo, "1T", 
+            url_promiedos, ["ENTRETIEMPO", "JUGANDO_2T", "FINAL"], canal_nombre,
+            streams_precargados=streams_precargados_1t
         )
         
-        os.remove(lista)
-        
-        if resultado.returncode == 0:
-            log_partido(nombre_partido, f"✅ Video completo creado: {os.path.basename(salida)}")
-            # Limpiar partes individuales
-            try:
-                os.remove(v1)
-                os.remove(v2)
-                log_partido(nombre_partido, "🧹 Archivos temporales eliminados")
-            except:
-                pass
-            return True
-        else:
-            log_partido(nombre_partido, "❌ Error en la unión de videos")
-            return False
-            
-    except Exception as e:
-        log_partido(nombre_partido, f"❌ Error crítico uniendo videos: {e}")
-        return False
-
-def prebuscar_streams(fuentes_video, nombre_archivo, cache_key):
-    """Búsqueda anticipada de streams y guardado en caché"""
-    log_partido(nombre_archivo, f"🔍 PREBÚSQUEDA: Analizando {len(fuentes_video)} fuentes...")
-    
-    mejor_stream = smart_selector.obtener_mejor_stream(fuentes_video)
-    
-    if mejor_stream:
-        with lock_cache:
-            cache_streams[cache_key] = {
-                'stream': mejor_stream,
-                'timestamp': time.time(),
-                'fuentes_backup': fuentes_video
-            }
-        log_partido(nombre_archivo, f"✅ Stream pre-cargado: {mejor_stream.fuente}")
-        return True
-    else:
-        log_partido(nombre_archivo, "⚠️ No se encontraron streams en prebúsqueda")
-        return False
-
-def obtener_stream_con_fallback(cache_key, fuentes_video, nombre_archivo, fase):
-    """Obtiene stream del caché o busca uno nuevo con sistema de fallback"""
-    
-    # Intentar usar caché si está fresco (menos de 10 min)
-    with lock_cache:
-        if cache_key in cache_streams:
-            cache_data = cache_streams[cache_key]
-            edad = time.time() - cache_data['timestamp']
-            if edad < 600:  # 10 minutos
-                log_partido(nombre_archivo, f"📦 Usando stream cacheado para {fase} (edad: {int(edad)}s)")
-                return cache_data['stream']
-    
-    # Buscar nuevo stream
-    log_partido(nombre_archivo, f"🔍 Buscando stream fresco para {fase}...")
-    
-    for intento in range(MAX_REINTENTOS_STREAM):
-        if intento > 0:
-            log_partido(nombre_archivo, f"🔄 Reintento {intento + 1}/{MAX_REINTENTOS_STREAM}")
-            time.sleep(5)
-        
-        stream = smart_selector.obtener_mejor_stream(fuentes_video)
-        
-        if stream:
-            # Actualizar caché
-            with lock_cache:
-                cache_streams[cache_key] = {
-                    'stream': stream,
-                    'timestamp': time.time(),
-                    'fuentes_backup': fuentes_video
-                }
-            return stream
-    
-    log_partido(nombre_archivo, f"❌ No se pudo obtener stream después de {MAX_REINTENTOS_STREAM} intentos")
-    return None
-
-def monitorear_grabacion(proceso, stream_obj, nombre_partido, fase):
-    """Monitorea la salud de la grabación y reinicia si falla"""
-    ultimo_check = time.time()
-    
-    while proceso and proceso.poll() is None:
-        time.sleep(30)
-        
-        # Verificar cada 90s que el proceso siga vivo
-        if time.time() - ultimo_check > INTERVALO_CHECK_SALUD:
-            if proceso.poll() is not None:
-                log_partido(nombre_partido, f"⚠️ Grabación {fase} falló, requiere reinicio")
-                return False
-            ultimo_check = time.time()
-    
-    return True
-
-def gestionar_partido(fuentes_video, url_promiedos, nombre_archivo, hora_inicio):
-    """Gestor principal con todas las mejoras"""
-    cache_key = nombre_archivo
-    
-    log_partido(nombre_archivo, "="*60)
-    log_partido(nombre_archivo, f"📅 PARTIDO AGENDADO: {nombre_archivo}")
-    log_partido(nombre_archivo, f"⏰ Hora de inicio: {hora_inicio}")
-    log_partido(nombre_archivo, f"🔗 Promiedos: {url_promiedos}")
-    log_partido(nombre_archivo, "="*60)
-    
-    ahora = datetime.now()
-    h_match = datetime.strptime(hora_inicio, "%H:%M").replace(
-        year=ahora.year, month=ahora.month, day=ahora.day
-    )
-    
-    # Ajustar si el partido es al día siguiente
-    if h_match < ahora:
-        h_match += timedelta(days=1)
-    
-    h_prebusqueda = h_match - timedelta(minutes=MINUTOS_PREBUSQUEDA)
-    h_inicio_grabacion = h_match - timedelta(minutes=MINUTOS_PREVIA)
-    
-    # --- FASE 0: ESPERA HASTA PREBÚSQUEDA ---
-    espera_prebusqueda = (h_prebusqueda - datetime.now()).total_seconds()
-    if espera_prebusqueda > 0:
-        log_partido(nombre_archivo, f"⏳ Esperando {int(espera_prebusqueda/60)} min hasta prebúsqueda...")
-        time.sleep(espera_prebusqueda)
-    
-    # --- PREBÚSQUEDA DE STREAMS (15 min antes) ---
-    log_partido(nombre_archivo, "🚀 Iniciando prebúsqueda de streams...")
-    prebuscar_streams(fuentes_video, nombre_archivo, cache_key)
-    
-    # --- ESPERA HASTA INICIO DE GRABACIÓN ---
-    espera_inicio = (h_inicio_grabacion - datetime.now()).total_seconds()
-    if espera_inicio > 0:
-        log_partido(nombre_archivo, f"⏳ Esperando {int(espera_inicio/60)} min para iniciar grabación...")
-        time.sleep(espera_inicio)
-    
-    # Rutas de archivo
-    ruta_1t = f"{CARPETA_LOCAL}/{nombre_archivo}_1T.mp4"
-    ruta_2t = f"{CARPETA_LOCAL}/{nombre_archivo}_2T.mp4"
-    ruta_full = f"{CARPETA_LOCAL}/{nombre_archivo}_FULL.mp4"
-    
-    tenemos_1t = False
-    proceso_1t = None
-    
-    # --- FASE 1: PRIMER TIEMPO ---
-    log_partido(nombre_archivo, "📡 Consultando estado del partido...")
+    # 4. ENTRETIEMPO
     estado = promiedos_client.obtener_estado_partido(url_promiedos)
-    log_partido(nombre_archivo, f"   Estado actual: {estado}")
-    
-    if estado in ["PREVIA", "JUGANDO_1T"]:
-        stream_1t = obtener_stream_con_fallback(cache_key, fuentes_video, nombre_archivo, "1T")
-        
-        if stream_1t:
-            proceso_1t = iniciar_grabacion_ffmpeg(stream_1t, ruta_1t, nombre_archivo)
-            
-            if proceso_1t:
-                tenemos_1t = True
-                tiempo_extra = stream_1t.delay + MARGEN_SEGURIDAD
-                
-                log_partido(nombre_archivo, "🎮 Monitoreando 1er tiempo...")
-                
-                # Contador para evitar spam de logs
-                contador_checks = 0
-                
-                while True:
-                    time.sleep(INTERVALO_REFRESCO_ESTADO)
-                    contador_checks += 1
-                    
-                    # Verificar que la grabación siga activa cada 3 checks
-                    if contador_checks % 3 == 0:
-                        if not verificar_grabacion_activa(proceso_1t, nombre_archivo):
-                            log_partido(nombre_archivo, "⚠️ Grabación 1T falló, reintentando...")
-                            stream_1t = obtener_stream_con_fallback(cache_key, fuentes_video, nombre_archivo, "1T (Reinicio)")
-                            if stream_1t:
-                                proceso_1t = iniciar_grabacion_ffmpeg(stream_1t, ruta_1t, nombre_archivo)
-                    
-                    estado = promiedos_client.obtener_estado_partido(url_promiedos)
-                    
-                    # Solo loggear si el estado cambió
-                    if contador_checks == 1 or estado not in ["PREVIA", "JUGANDO_1T"]:
-                        log_partido(nombre_archivo, f"   Estado: {estado}")
-                    
-                    if estado in ["ENTRETIEMPO", "JUGANDO_2T"]:
-                        log_partido(nombre_archivo, f"⏸️ Fin 1T detectado. Esperando {int(tiempo_extra)}s (delay + buffer)...")
-                        time.sleep(tiempo_extra)
-                        detener_grabacion(proceso_1t, nombre_archivo, "1T")
-                        break
-                    
-                    if estado == "FINAL":
-                        log_partido(nombre_archivo, "🏁 Partido terminó en 1T (suspendido/walkover)")
-                        detener_grabacion(proceso_1t, nombre_archivo, "1T")
-                        return
-            else:
-                log_partido(nombre_archivo, "❌ No se pudo iniciar grabación del 1T")
-        else:
-            log_partido(nombre_archivo, "❌ No hay streams disponibles para el 1T")
-    else:
-        log_partido(nombre_archivo, "⏩ El 1T ya finalizó, esperando 2T...")
-    
-    # --- FASE 2: ENTRETIEMPO ---
     if estado not in ["FINAL", "JUGANDO_2T"]:
-        log_partido(nombre_archivo, f"☕ ENTRETIEMPO - Esperando 2T (máx {int(TIMEOUT_ENTRETIEMPO/60)} min)...")
+        log_partido(nombre_archivo, "☕ En Entretiempo...")
         inicio_et = time.time()
+        streams_2t_listos = False
         
         while True:
-            time.sleep(15)
+            time.sleep(10)
+            mins = (time.time() - inicio_et) / 60
+            
+            # Buscar streams para el 2T una sola vez y guardarlos
+            if mins >= MINUTOS_ESPERA_BUSQUEDA_2T and not streams_2t_listos:
+                 log_partido(nombre_archivo, "🕵️ Buscando streams para 2T anticipadamente...")
+                 streams_precargados_2t = smart_selector.obtener_mejores_streams(fuentes_canal)
+                 streams_2t_listos = True
+            
             estado = promiedos_client.obtener_estado_partido(url_promiedos)
-            
-            if estado == "JUGANDO_2T":
-                log_partido(nombre_archivo, "🚀 ¡Arrancó el 2T!")
-                break
-            
-            if estado == "FINAL":
-                log_partido(nombre_archivo, "⚠️ Partido terminó durante el entretiempo")
-                return
-            
-            if (time.time() - inicio_et) > TIMEOUT_ENTRETIEMPO:
-                log_partido(nombre_archivo, "⚠️ Timeout de entretiempo alcanzado, iniciando 2T por seguridad")
-                break
-    
-    # --- FASE 3: SEGUNDO TIEMPO ---
-    log_partido(nombre_archivo, "🔄 Refrescando búsqueda de streams para 2T...")
-    stream_2t = obtener_stream_con_fallback(cache_key, fuentes_video, nombre_archivo, "2T")
-    
-    if stream_2t:
-        proceso_2t = iniciar_grabacion_ffmpeg(stream_2t, ruta_2t, nombre_archivo)
-        
-        if proceso_2t:
-            tiempo_extra = stream_2t.delay + MARGEN_SEGURIDAD + 60  # Extra para festejos
-            
-            log_partido(nombre_archivo, "🎮 Monitoreando 2do tiempo...")
-            
-            # Contador para evitar spam de logs
-            contador_checks = 0
-            
-            while True:
-                time.sleep(INTERVALO_REFRESCO_ESTADO)
-                contador_checks += 1
-                
-                # Verificar salud de grabación cada 3 checks
-                if contador_checks % 3 == 0:
-                    if not verificar_grabacion_activa(proceso_2t, nombre_archivo):
-                        log_partido(nombre_archivo, "⚠️ Grabación 2T falló, reintentando...")
-                        stream_2t = obtener_stream_con_fallback(cache_key, fuentes_video, nombre_archivo, "2T (Reinicio)")
-                        if stream_2t:
-                            proceso_2t = iniciar_grabacion_ffmpeg(stream_2t, ruta_2t, nombre_archivo)
-                
-                estado = promiedos_client.obtener_estado_partido(url_promiedos)
-                
-                # Solo loggear si hay cambio de estado
-                if contador_checks == 1 or estado == "FINAL":
-                    log_partido(nombre_archivo, f"   Estado: {estado}")
-                
-                if estado == "FINAL":
-                    log_partido(nombre_archivo, f"🏁 FINAL - Esperando {int(tiempo_extra)}s adicionales...")
-                    time.sleep(tiempo_extra)
-                    detener_grabacion(proceso_2t, nombre_archivo, "2T")
-                    break
-    else:
-        log_partido(nombre_archivo, "❌ No hay streams disponibles para el 2T")
-        return
-    
-    # --- FASE 4: POST-PRODUCCIÓN ---
-    log_partido(nombre_archivo, "🎬 Iniciando post-producción...")
-    
-    if os.path.exists(ruta_1t) and os.path.exists(ruta_2t):
-        if unir_videos(ruta_1t, ruta_2t, ruta_full, nombre_archivo):
-            log_partido(nombre_archivo, "☁️ Subiendo a Streamtape...")
-            link = uploader.subir_video(ruta_full)
-            if link:
-                log_partido(nombre_archivo, f"✅ LINK PÚBLICO: {link}")
-                # Guardar link en archivo
-                with open(f"{CARPETA_LOCAL}/links.txt", "a") as f:
-                    f.write(f"{nombre_archivo}: {link}\n")
-    elif os.path.exists(ruta_2t):
-        log_partido(nombre_archivo, "✅ Solo se grabó el 2T")
-        os.rename(ruta_2t, ruta_full)
-    elif os.path.exists(ruta_1t):
-        log_partido(nombre_archivo, "✅ Solo se grabó el 1T")
-        os.rename(ruta_1t, ruta_full)
-    
-    log_partido(nombre_archivo, "="*60)
-    log_partido(nombre_archivo, "🎉 PROCESO COMPLETADO")
-    log_partido(nombre_archivo, "="*60)
+            if estado == "JUGANDO_2T" or mins >= MINUTOS_FORCE_START_2T: break
+            if estado == "FINAL": return
 
-def resolver_fuentes_de_tv(canales_partido):
-    """Resuelve fuentes con mejor logging"""
-    fuentes_totales = []
-    canales_encontrados = []
-    canales_faltantes = []
+    # 5. FASE 2T
+    # AQUÍ ESTÁ EL CAMBIO: Pasamos la variable precargada del entretiempo
+    rutas_gen_2t = grabar_fase_con_redundancia(
+        fuentes_canal, ruta_base_2t, nombre_archivo, "2T", 
+        url_promiedos, ["FINAL"], canal_nombre,
+        streams_precargados=streams_precargados_2t
+    )
     
-    for canal_promiedos in canales_partido:
-        encontrado = False
-        for key_config, links in GRILLA_CANALES.items():
-            if key_config.lower() in canal_promiedos.lower():
-                fuentes_totales.extend(links)
-                canales_encontrados.append(f"{canal_promiedos} → {key_config}")
-                encontrado = True
-                break
-        
-        if not encontrado:
-            canales_faltantes.append(canal_promiedos)
-    
-    print(f"\n📺 CANALES DETECTADOS: {', '.join(canales_partido)}")
-    if canales_encontrados:
-        print(f"✅ Mapeados:")
-        for c in canales_encontrados:
-            print(f"   • {c}")
-    if canales_faltantes:
-        print(f"⚠️  Sin configurar:")
-        for c in canales_faltantes:
-            print(f"   • {c}")
-    
-    return fuentes_totales
+    # 6. FINALIZAR
+    if unir_videos_final(rutas_gen_1t, rutas_gen_2t, ruta_final, nombre_archivo):
+        log_partido(nombre_archivo, "☁️ Subiendo...")
+        link = uploader.subir_video(ruta_final)
+        if link:
+            log_partido(nombre_archivo, f"✅ LINK: {link}")
+            with open(f"{CARPETA_LOCAL}/links.txt", "a") as f: f.write(f"{nombre_archivo}: {link}\n")
 
 if __name__ == "__main__":
     setup_directorios()
+    print("🚀 SISTEMA MAESTRO v4.1 (SIN RE-ESCANEO)")
     
-    print("="*70)
-    print("🚀 SISTEMA DE GRABACIÓN INTELIGENTE v2.0")
-    print("="*70)
-    
-    # URLS DE PROMIEDOS
-    URLS_PROMIEDOS = [
-        "https://www.promiedos.com.ar/game/villarreal-vs-fc-copenhagen/efdieji",
-    ]
+    URLS = ["https://www.promiedos.com.ar/game/racing-club-vs-estudiantes-de-la-plata/egcjbed"]
     
     hilos = []
-    partidos_configurados = []
-    
-    for idx, url in enumerate(URLS_PROMIEDOS, 1):
-        print(f"\n{'='*70}")
-        print(f"📋 CONFIGURANDO PARTIDO {idx}/{len(URLS_PROMIEDOS)}")
-        print(f"🔗 {url}")
-        
+    for url in URLS:
         meta = promiedos_client.obtener_metadata_partido(url)
-        
         if meta:
-            fuentes = resolver_fuentes_de_tv(meta['canales'])
-            
-            if fuentes:
-                print(f"✅ {len(fuentes)} fuentes de video configuradas")
-                
-                t = threading.Thread(
-                    target=gestionar_partido,
-                    args=(fuentes, url, meta['nombre'], meta['hora']),
-                    daemon=False
-                )
-                hilos.append(t)
-                partidos_configurados.append(meta['nombre'])
-                t.start()
-                
-                # Pequeña pausa entre inicios de threads
-                time.sleep(1)
-            else:
-                print(f"❌ Sin fuentes disponibles para: {meta['nombre']}")
-        else:
-            print("❌ Error obteniendo metadata de Promiedos")
-    
-    print(f"\n{'='*70}")
-    print(f"✅ {len(partidos_configurados)} partidos en cola de grabación:")
-    for partido in partidos_configurados:
-        print(f"   • {partido}")
-    print(f"{'='*70}\n")
-    
-    # Esperar todos los hilos
-    for t in hilos:
-        t.join()
-    
-    print("\n🎉 TODOS LOS PARTIDOS FINALIZADOS")
-    print(f"📁 Videos guardados en: {CARPETA_LOCAL}")
-    print(f"📝 Logs disponibles en: {CARPETA_LOGS}")
+            t = threading.Thread(target=gestionar_partido, args=(url, meta['nombre'], meta['hora']))
+            t.start()
+            hilos.append(t)
+    for t in hilos: t.join()
