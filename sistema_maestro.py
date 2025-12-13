@@ -10,6 +10,7 @@ from collections import defaultdict
 import promiedos_client
 import smart_selector
 import uploader
+from urllib.parse import urlparse
 
 # ================= CONFIGURACIÓN "ULTRA-ROBUSTA" =================
 CARPETA_LOCAL = "./partidos_grabados"
@@ -18,7 +19,7 @@ CARPETA_TEMP = "./temp_segments"
 
 # --- TIEMPOS Y TIMEOUTS ---
 MARGEN_SEGURIDAD = 90           
-MINUTOS_PREVIA = 500000000
+MINUTOS_PREVIA = 5
 MINUTOS_PREBUSQUEDA = 15        
 TIMEOUT_ENTRETIEMPO = 1800      
 MAX_REINTENTOS_STREAM = 5       
@@ -90,36 +91,113 @@ def obtener_tamanio_archivo(ruta):
 
 # ================= MOTOR DE GRABACIÓN =================
 def iniciar_grabacion_ffmpeg(stream_obj, ruta_salida, nombre_partido, sufijo=""):
+    """
+    Graba HLS usando FFMPEG directamente (más confiable que yt-dlp para streams protegidos)
+    """
     log_partido(nombre_partido, f"🎥 Iniciando REC{sufijo}: {os.path.basename(ruta_salida)}")
-    log_partido(nombre_partido, f"   Stream: {stream_obj.fuente} (Delay: {stream_obj.delay:.1f}s)")
+    log_partido(nombre_partido, f"   URL: {stream_obj.url[:100]}...")
+    log_partido(nombre_partido, f"   Delay: {stream_obj.delay:.1f}s, Bitrate: {stream_obj.bitrate:.1f}Mbps")
     
+    # Construir headers HTTP para ffmpeg
+    headers_str = ""
+    headers_str += f"User-Agent: {stream_obj.ua}\\r\\n"
+    headers_str += f"Referer: {stream_obj.referer}\\r\\n"
+    headers_str += f"Origin: {urlparse(stream_obj.referer).scheme}://{urlparse(stream_obj.referer).netloc}\\r\\n"
+    headers_str += "Accept: */*\\r\\n"
+    headers_str += "Accept-Language: es-419,es;q=0.9\\r\\n"
+    headers_str += "Sec-Fetch-Dest: empty\\r\\n"
+    headers_str += "Sec-Fetch-Mode: cors\\r\\n"
+    headers_str += "Sec-Fetch-Site: cross-site\\r\\n"
+    
+    # Agregar cookies si existen
+    if hasattr(stream_obj, 'cookies') and stream_obj.cookies:
+        cookie_str = "; ".join([f"{k}={v}" for k, v in stream_obj.cookies.items()])
+        headers_str += f"Cookie: {cookie_str}\\r\\n"
+        log_partido(nombre_partido, f"   🍪 {len(stream_obj.cookies)} cookies")
+    
+    # Comando ffmpeg optimizado para HLS
     cmd = [
-        "yt-dlp", stream_obj.url,
-        "-o", ruta_salida,
-        "--hls-prefer-native", "--live-from-start",
-        "--concurrent-fragments", "10", "--buffer-size", "256K", "--http-chunk-size", "10M",
-        "--add-header", f"Referer:{stream_obj.referer}",
-        "--add-header", f"User-Agent:{stream_obj.ua}",
-        "--socket-timeout", "30", "--no-warnings", "--quiet",
-        "--retries", "20", "--fragment-retries", "20", "--ignore-errors", "--no-abort-on-error"
+        "ffmpeg",
+        "-headers", headers_str,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "10",
+        "-timeout", "30000000",  # 30 segundos en microsegundos
+        "-i", stream_obj.url,
+        "-c", "copy",  # No re-encodear (más rápido y estable)
+        "-bsf:a", "aac_adtstoasc",  # Fix para audio AAC
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        "-loglevel", "warning",
+        "-y",  # Sobrescribir si existe
+        ruta_salida
     ]
     
     try:
-        proceso = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        log_partido(nombre_partido, f"   🚀 Lanzando ffmpeg...")
+        
+        proceso = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL
+        )
+        
+        # Verificar que inició correctamente
+        time.sleep(3)
+        
+        if proceso.poll() is not None:
+            # Proceso murió inmediatamente
+            stdout = proceso.stdout.read().decode('utf-8', errors='ignore')
+            stderr = proceso.stderr.read().decode('utf-8', errors='ignore')
+            
+            log_partido(nombre_partido, f"   ❌ FFMPEG murió inmediatamente")
+            log_partido(nombre_partido, f"      STDERR: {stderr[:500]}")
+            
+            # Guardar logs completos
+            with open(f"{CARPETA_LOGS}/{nombre_partido}_ffmpeg_error.log", "a") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"Timestamp: {datetime.now()}\n")
+                f.write(f"URL: {stream_obj.url}\n")
+                f.write(f"Command: {' '.join(cmd)}\n")
+                f.write(f"\nSTDERR:\n{stderr}\n")
+            
+            return None
+        
+        # Verificar que el archivo se está escribiendo
+        time.sleep(5)
+        if os.path.exists(ruta_salida):
+            size = os.path.getsize(ruta_salida)
+            if size > 0:
+                log_partido(nombre_partido, f"   ✅ Grabación iniciada ({size} bytes)")
+                return proceso
+            else:
+                log_partido(nombre_partido, f"   ⚠️ Archivo creado pero vacío")
+        else:
+            log_partido(nombre_partido, f"   ⚠️ Archivo no creado aún (esperando datos)")
+        
         return proceso
+        
     except Exception as e:
-        log_partido(nombre_partido, f"❌ Error lanzando yt-dlp: {e}")
+        log_partido(nombre_partido, f"❌ Error lanzando ffmpeg: {e}")
         return None
 
 def detener_grabacion_suave(proceso, nombre_partido, etiqueta=""):
+    """Detiene ffmpeg enviando 'q' (quit gracefully)"""
     if proceso and proceso.poll() is None:
         log_partido(nombre_partido, f"🛑 Deteniendo {etiqueta}...")
         try:
-            proceso.send_signal(signal.SIGINT)
-            proceso.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            log_partido(nombre_partido, "⚠️ Timeout stop, forzando kill...")
-            proceso.kill()
+            # FFMPEG acepta 'q' para terminar gracefully
+            proceso.stdin.write(b'q')
+            proceso.stdin.flush()
+            proceso.wait(timeout=15)
+        except:
+            try:
+                proceso.send_signal(signal.SIGINT)
+                proceso.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                log_partido(nombre_partido, "⚠️ Timeout stop, forzando kill...")
+                proceso.kill()
 
 # ================= GRABACIÓN RESILIENTE =================
 def grabar_fase_con_redundancia(fuentes_canal, ruta_base, nombre_partido, fase, 
