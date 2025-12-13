@@ -1,13 +1,11 @@
 """
-SISTEMA MAESTRO v7.0 - 0% PÉRDIDA GARANTIZADA
-OPTIMIZACIONES CLAVE:
-- Buffer inicio: -3min, fin: +5min (nunca pierde inicio/fin)
-- Overlapping redundante: 60s entre cambios
-- Múltiples partidos simultáneos con locks
-- Detección conservadora (prefiere grabar de más)
-- Recuperación automática triple
-- Limpieza automática de frames
-- Rate limiting por partido
+SISTEMA MAESTRO v8.0 - 0% PÉRDIDA + VALIDACIÓN EN TIEMPO REAL
+MEJORAS CRÍTICAS v8:
+- IA SOLO para validar contenido de streams (pantalla negra, congelamiento)
+- Estado de partido: SOLO Promiedos/SofaScore (backup)
+- Monitoreo en tiempo real de calidad de video
+- Recuperación automática ante streams problemáticos
+- Múltiples fuentes de metadata (Promiedos → SofaScore)
 """
 
 import time
@@ -20,11 +18,12 @@ from datetime import datetime, timedelta
 from config_tv import GRILLA_CANALES
 from collections import defaultdict
 import promiedos_client
+import sofascore_client  # NUEVO: Backup
 import smart_selector
 import uploader
 import sync_manager
+from stream_health_monitor import MultiStreamHealthManager  # NUEVO
 from urllib.parse import urlparse
-from vision_detector import HybridStateDetectorV3
 
 # ================= CONFIGURACIÓN OPTIMIZADA =================
 
@@ -33,35 +32,36 @@ CARPETA_LOCAL = "./partidos_grabados"
 CARPETA_LOGS = "./logs"
 CARPETA_TEMP = "./temp_segments"
 
-# Streams paralelos (AUMENTADO para redundancia)
-MAX_STREAMS_PARALELOS = 4  # Aumentado de 3 a 4
+# Streams paralelos
+MAX_STREAMS_PARALELOS = 5  # Aumentado de 4 a 5 para más redundancia
 THRESHOLD_TAMAÑO_CORTE = 512 * 1024
 
-# Monitoreo más frecuente
-INTERVALO_HEALTH_CHECK = 3  # Reducido de 5 a 3
-INTERVALO_VALIDACION_CONTENIDO = 8
+# Monitoreo MÁS FRECUENTE
+INTERVALO_HEALTH_CHECK = 2  # Cada 2 segundos
+INTERVALO_VALIDACION_METADATA = 20  # Verificar Promiedos/SofaScore cada 20s
 
-# Entretiempo (MÁS CONSERVADOR)
-MINUTOS_ESPERA_BUSQUEDA_2T = 2  # Reducido de 3 a 2
-MINUTOS_FORCE_START_2T = 12  # Reducido de 15 a 12
+# Entretiempo
+MINUTOS_ESPERA_BUSQUEDA_2T = 2
+MINUTOS_FORCE_START_2T = 12
 
 # Prioridad
 PRIORIDAD_CANALES = [
     "ESPN Premium", "TNT Sports Premium", "TNT Sports", 
-    "Fox Sports", "ESPN", "ESPN 2", "TyC Sports"
+    "Fox Sports", "ESPN", "ESPN 2", "TyC Sports",
+    "Disney+ Premium"
 ]
 
-# Overlap AUMENTADO (CRÍTICO PARA 0% PÉRDIDA)
-OVERLAP_SEGUNDOS = 60  # Aumentado de 30 a 60
+# Overlap
+OVERLAP_SEGUNDOS = 60
 
-# Buffers de seguridad (CRÍTICO)
-BUFFER_INICIO_PARTIDO = 180  # 3 minutos antes
-BUFFER_FIN_PARTIDO = 300  # 5 minutos después
+# Buffers
+BUFFER_INICIO_PARTIDO = 180
+BUFFER_FIN_PARTIDO = 300
 
-# Rate limiting por partido
-MIN_VERIFICACIONES_ENTRE_PARTIDOS = 15  # 15s entre checks de diferentes partidos
+# Rate limiting
+MIN_VERIFICACIONES_ENTRE_PARTIDOS = 15
 
-# Locks globales para múltiples partidos
+# Locks
 _lock_partidos = threading.Lock()
 _partidos_activos = {}
 _ultimo_check_partido = {}
@@ -82,12 +82,75 @@ def log_partido(nombre_archivo, mensaje):
     log_msg = f"[{timestamp}] {mensaje}"
     print(log_msg)
     
-    # Thread-safe logging
     try:
         with open(f"{CARPETA_LOGS}/{nombre_archivo}.log", "a", encoding='utf-8') as f:
             f.write(log_msg + "\n")
     except:
         pass
+
+# ================= GESTIÓN DE METADATA CON BACKUP =================
+
+def obtener_metadata_con_backup(url_promiedos, url_sofascore=None):
+    """
+    Intenta Promiedos primero, si falla usa SofaScore
+    """
+    log_partido("sistema", "📡 Obteniendo metadata...")
+    
+    # Intento 1: Promiedos
+    try:
+        meta = promiedos_client.obtener_metadata_partido(url_promiedos)
+        if meta and meta.get('canales'):
+            log_partido("sistema", f"✅ Promiedos: {len(meta['canales'])} canales")
+            return meta, "promiedos"
+    except Exception as e:
+        log_partido("sistema", f"⚠️ Promiedos falló: {str(e)[:60]}")
+    
+    # Intento 2: SofaScore (backup)
+    if url_sofascore:
+        try:
+            meta = sofascore_client.obtener_metadata_partido(url_sofascore)
+            if meta:
+                log_partido("sistema", f"✅ SofaScore (backup): {meta['nombre']}")
+                
+                # Si SofaScore no tiene canales, intentar extraer de Promiedos solo metadata
+                if not meta.get('canales'):
+                    try:
+                        meta_prom = promiedos_client.obtener_metadata_partido(url_promiedos)
+                        if meta_prom and meta_prom.get('canales'):
+                            meta['canales'] = meta_prom['canales']
+                            log_partido("sistema", f"✅ Canales de Promiedos: {len(meta['canales'])}")
+                    except:
+                        pass
+                
+                return meta, "sofascore"
+        except Exception as e:
+            log_partido("sistema", f"⚠️ SofaScore falló: {str(e)[:60]}")
+    
+    log_partido("sistema", "❌ No se pudo obtener metadata de ninguna fuente")
+    return None, None
+
+def obtener_estado_con_backup(url_promiedos, url_sofascore=None):
+    """
+    Intenta Promiedos primero, si falla usa SofaScore
+    """
+    # Intento 1: Promiedos
+    try:
+        estado = promiedos_client.obtener_estado_partido(url_promiedos)
+        if estado != "ERROR":
+            return estado, "promiedos"
+    except Exception:
+        pass
+    
+    # Intento 2: SofaScore
+    if url_sofascore:
+        try:
+            estado = sofascore_client.obtener_estado_partido(url_sofascore)
+            if estado != "ERROR":
+                return estado, "sofascore"
+        except Exception:
+            pass
+    
+    return "ERROR", None
 
 # ================= LÓGICA DE CANALES =================
 
@@ -129,11 +192,12 @@ def obtener_tamanio_archivo(ruta):
     except: 
         return 0
 
-# ================= MOTOR DE GRABACIÓN MEJORADO =================
+# ================= MOTOR DE GRABACIÓN CON MONITOREO =================
 
-def iniciar_grabacion_ffmpeg_robusto(stream_obj, ruta_salida, nombre_partido, sufijo="", stream_monitor=None):
+def iniciar_grabacion_con_monitoreo(stream_obj, ruta_salida, nombre_partido, 
+                                    sufijo="", health_manager=None):
     """
-    Grabación con parámetros optimizados para estabilidad
+    Grabación con monitoreo de salud en tiempo real
     """
     log_partido(nombre_partido, f"🎥 Iniciando REC{sufijo}: {os.path.basename(ruta_salida)}")
     log_partido(nombre_partido, f"   URL: {stream_obj.url[:100]}...")
@@ -145,29 +209,25 @@ def iniciar_grabacion_ffmpeg_robusto(stream_obj, ruta_salida, nombre_partido, su
     headers_str += f"Origin: {urlparse(stream_obj.referer).scheme}://{urlparse(stream_obj.referer).netloc}\\r\\n"
     headers_str += "Accept: */*\\r\\n"
     headers_str += "Accept-Language: es-419,es;q=0.9\\r\\n"
-    headers_str += "Sec-Fetch-Dest: empty\\r\\n"
-    headers_str += "Sec-Fetch-Mode: cors\\r\\n"
-    headers_str += "Sec-Fetch-Site: cross-site\\r\\n"
     
     if hasattr(stream_obj, 'cookies') and stream_obj.cookies:
         cookie_str = "; ".join([f"{k}={v}" for k, v in stream_obj.cookies.items()])
         headers_str += f"Cookie: {cookie_str}\\r\\n"
     
-    # Parámetros optimizados para estabilidad
     cmd = [
         "ffmpeg",
         "-headers", headers_str,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "8",  # Reducido para recuperación más rápida
+        "-reconnect_delay_max", "5",
         "-timeout", "30000000",
         "-i", stream_obj.url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+faststart",
-        "-max_muxing_queue_size", "2048",  # Aumentado
-        "-avoid_negative_ts", "make_zero",  # Evita problemas de timestamp
-        "-fflags", "+genpts",  # Genera timestamps si faltan
+        "-max_muxing_queue_size", "4096",  # Aumentado
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts+discardcorrupt",  # Descartar frames corruptos
         "-loglevel", "warning",
         "-y",
         ruta_salida
@@ -193,8 +253,16 @@ def iniciar_grabacion_ffmpeg_robusto(stream_obj, ruta_salida, nombre_partido, su
             size = os.path.getsize(ruta_salida)
             if size > 0:
                 log_partido(nombre_partido, f"   ✅ Grabación iniciada ({size} bytes)")
-                if stream_monitor:
-                    stream_monitor.registrar_stream(proceso, ruta_salida, stream_obj)
+                
+                # NUEVO: Registrar en health monitor
+                if health_manager:
+                    # Extraer ID del sufijo
+                    import re
+                    match = re.search(r's(\d+)', sufijo.lower())
+                    if match:
+                        stream_id = int(match.group(1))
+                        health_manager.registrar_stream(stream_id, ruta_salida)
+                
                 return proceso
         
         return proceso
@@ -217,22 +285,23 @@ def detener_grabacion_suave(proceso, nombre_partido, etiqueta=""):
             except subprocess.TimeoutExpired:
                 proceso.kill()
 
-# ================= GRABACIÓN CON VISION v3 =================
+# ================= GRABACIÓN CON MONITOREO EN TIEMPO REAL =================
 
-def grabar_con_vision_v3(fuentes_canal, ruta_base, nombre_partido, 
-                         url_promiedos, detector, estados_fin,
-                         streams_precargados=None):
+def grabar_con_monitoreo_salud(fuentes_canal, ruta_base, nombre_partido, 
+                                url_promiedos, url_sofascore, estados_fin,
+                                streams_precargados=None):
     """
-    Grabación con detección optimizada y overlapping redundante
+    Grabación con monitoreo de salud en tiempo real
+    IA SOLO para validar contenido, NO para detectar estado
     """
-    log_partido(nombre_partido, f"🚀 GRABACIÓN CON VISION AI v3 (0% PÉRDIDA)")
+    log_partido(nombre_partido, f"🚀 GRABACIÓN CON MONITOREO EN TIEMPO REAL")
     log_partido(nombre_partido, f"   Configuración:")
     log_partido(nombre_partido, f"   • Streams paralelos: {MAX_STREAMS_PARALELOS}")
     log_partido(nombre_partido, f"   • Overlap: {OVERLAP_SEGUNDOS}s")
-    log_partido(nombre_partido, f"   • Buffer inicio: -{BUFFER_INICIO_PARTIDO}s")
-    log_partido(nombre_partido, f"   • Buffer fin: +{BUFFER_FIN_PARTIDO}s")
+    log_partido(nombre_partido, f"   • Monitoreo cada {INTERVALO_HEALTH_CHECK}s")
     
-    monitor = sync_manager.StreamMonitor(nombre_partido)
+    # NUEVO: Health Manager
+    health_manager = MultiStreamHealthManager(nombre_partido)
     
     procesos = []
     cambios_stream = 0
@@ -255,179 +324,177 @@ def grabar_con_vision_v3(fuentes_canal, ruta_base, nombre_partido,
         log_partido(nombre_partido, "❌ No hay streams disponibles")
         return []
     
-    # CRÍTICO: Iniciar MÁS streams en paralelo para redundancia
     max_streams = min(len(streams_unicos), MAX_STREAMS_PARALELOS)
     streams_respaldo = streams_unicos[max_streams:]
     
     log_partido(nombre_partido, f"📊 {max_streams} streams primarios + {len(streams_respaldo)} respaldo")
     
-    # Obtener headers
-    stream_principal = streams_unicos[0]
-    headers_vision = {
-        'User-Agent': stream_principal.ua,
-        'Referer': stream_principal.referer
-    }
-    
     # Iniciar streams
     for i in range(max_streams):
         stream = streams_unicos[i]
         ruta = f"{ruta_base}_p{cambios_stream}_s{i}.mp4"
-        p = iniciar_grabacion_ffmpeg_robusto(stream, ruta, nombre_partido, f" [S{i}]", monitor)
+        p = iniciar_grabacion_con_monitoreo(
+            stream, ruta, nombre_partido, f" [S{i}]", health_manager
+        )
         if p:
             procesos.append({
                 "proc": p, "ruta": ruta, "stream": stream,
                 "idx": i, "estado": "ok", "last_check": time.time(),
-                "last_size": 0, "stream_id": None
+                "last_size": 0, "stream_id": i
             })
     
     log_partido(nombre_partido, f"✅ {len([p for p in procesos if p['estado']=='ok'])} streams activos")
     
-    # BUCLE DE MONITOREO CON VISION v3
-    ultimo_check_estado = time.time()
-    ultimo_estado_vision = "DESCONOCIDO"
-    
-    # Variables de control conservador
-    confirmaciones_no_jugando = 0
-    CONFIRMACIONES_REQUERIDAS = 3  # Requiere 3 confirmaciones consecutivas
+    # BUCLE DE MONITOREO
+    ultimo_check_metadata = time.time()
+    fase_actual = "1T"
+    tiempo_inicio_fase = datetime.now()
     
     while True:
         time.sleep(INTERVALO_HEALTH_CHECK)
         now = time.time()
         
-        # A) VERIFICACIÓN CON VISION AI (con rate limiting por partido)
-        with _lock_partidos:
-            ultimo_check = _ultimo_check_partido.get(nombre_partido, 0)
-            puede_verificar = (now - ultimo_check) >= MIN_VERIFICACIONES_ENTRE_PARTIDOS
-        
-        if puede_verificar:
-            estado_detectado = detector.verificar_estado(
-                stream_principal.url,
-                headers_vision
-            )
-            
+        # A) VERIFICAR ESTADO DEL PARTIDO (Promiedos/SofaScore)
+        if now - ultimo_check_metadata >= INTERVALO_VALIDACION_METADATA:
             with _lock_partidos:
-                _ultimo_check_partido[nombre_partido] = now
+                ultimo_check = _ultimo_check_partido.get(nombre_partido, 0)
+                puede_verificar = (now - ultimo_check) >= MIN_VERIFICACIONES_ENTRE_PARTIDOS
             
-            # Lógica conservadora de confirmación
-            if estado_detectado == "NO_JUGANDO":
-                confirmaciones_no_jugando += 1
-                log_partido(nombre_partido, 
-                    f"   ⚠️ NO_JUGANDO detectado ({confirmaciones_no_jugando}/{CONFIRMACIONES_REQUERIDAS})")
+            if puede_verificar:
+                estado, fuente = obtener_estado_con_backup(url_promiedos, url_sofascore)
                 
-                # Solo terminar si hay múltiples confirmaciones
-                if confirmaciones_no_jugando >= CONFIRMACIONES_REQUERIDAS:
-                    # Verificar que se puede terminar la fase
-                    if detector._puede_terminar_fase():
-                        log_partido(nombre_partido, f"🏁 Fin de fase confirmado")
+                with _lock_partidos:
+                    _ultimo_check_partido[nombre_partido] = now
+                
+                log_partido(nombre_partido, f"📡 Estado ({fuente}): {estado}")
+                
+                # Verificar si puede terminar
+                tiempo_fase = (datetime.now() - tiempo_inicio_fase).total_seconds() / 60
+                
+                if estado in estados_fin:
+                    # Solo terminar si pasó tiempo mínimo
+                    if fase_actual == "1T" and tiempo_fase >= 35:
+                        log_partido(nombre_partido, "🏁 Fin 1T confirmado")
                         break
-                    else:
-                        log_partido(nombre_partido, 
-                            f"   ⏱️ Tiempo mínimo no alcanzado - continuando")
-                        confirmaciones_no_jugando = 0
-            else:
-                # Resetear contador si detecta JUGANDO
-                confirmaciones_no_jugando = 0
-            
-            ultimo_estado_vision = estado_detectado
-            
-            # Verificar estados fin tradicionales
-            if estado_detectado in estados_fin and detector._puede_terminar_fase():
-                log_partido(nombre_partido, f"🏁 Estado fin: {estado_detectado}")
-                break
+                    elif fase_actual == "2T" and tiempo_fase >= 35:
+                        log_partido(nombre_partido, "🏁 Fin 2T confirmado")
+                        break
+                    elif estado == "FINAL":
+                        log_partido(nombre_partido, "🏁 FINAL")
+                        break
+                
+                # Actualizar fase
+                if estado == "JUGANDO_2T" and fase_actual == "1T":
+                    fase_actual = "2T"
+                    tiempo_inicio_fase = datetime.now()
+                    log_partido(nombre_partido, "⚽ INICIO 2T")
+                
+                ultimo_check_metadata = now
         
-        # B) Health Check MÁS FRECUENTE
-        procesos_vivos = 0
-        procesos_problematicos = []
+        # B) VERIFICAR SALUD DE STREAMS (Health Monitor)
+        streams_problematicos = health_manager.obtener_streams_problematicos()
         
-        for idx, p_obj in enumerate(procesos):
-            if p_obj["estado"] == "dead":
-                continue
+        if streams_problematicos:
+            log_partido(nombre_partido, f"🚨 {len(streams_problematicos)} streams con problemas críticos")
             
-            if p_obj["stream_id"] is not None:
-                ok, msg = monitor.check_health(p_obj["stream_id"])
-                if not ok:
-                    procesos_problematicos.append(idx)
-                    p_obj["estado"] = "problema"
-                    log_partido(nombre_partido, f"   ⚠️ Problema en S{p_obj['idx']}: {msg}")
-                else:
-                    procesos_vivos += 1
-            else:
-                if p_obj["proc"].poll() is not None:
-                    p_obj["estado"] = "dead"
-                    log_partido(nombre_partido, f"   ☠️ S{p_obj['idx']} murió")
-                else:
-                    procesos_vivos += 1
-        
-        # C) Overlapping REDUNDANTE (60s)
-        if procesos_problematicos:
-            log_partido(nombre_partido, 
-                f"🔄 {len(procesos_problematicos)} streams con problemas - iniciando overlap")
-            
-            for idx_problema in procesos_problematicos:
+            for idx_problema in streams_problematicos:
+                # Buscar proceso correspondiente
+                proc_problema = next(
+                    (p for p in procesos if p.get('stream_id') == idx_problema),
+                    None
+                )
+                
+                if not proc_problema:
+                    continue
+                
+                log_partido(nombre_partido, f"   🔄 Reemplazando stream S{idx_problema}...")
+                
                 if streams_respaldo:
                     nuevo_s = streams_respaldo.pop(0)
                     cambios_stream += 1
-                    ruta_nuevo = f"{ruta_base}_overlap{cambios_stream}.mp4"
+                    ruta_nuevo = f"{ruta_base}_repair{cambios_stream}.mp4"
                     
-                    log_partido(nombre_partido, f"   🆕 Nuevo stream (overlap 60s)")
-                    
-                    proc_nuevo = iniciar_grabacion_ffmpeg_robusto(
-                        nuevo_s, ruta_nuevo, nombre_partido, " [OVERLAP]", monitor
+                    # Iniciar nuevo con overlap
+                    proc_nuevo = iniciar_grabacion_con_monitoreo(
+                        nuevo_s, ruta_nuevo, nombre_partido, 
+                        f" [REPAIR-{idx_problema}]", health_manager
                     )
                     
                     if proc_nuevo:
-                        # CRÍTICO: Overlap de 60s
+                        # Overlap
                         log_partido(nombre_partido, f"   ⏳ Overlap {OVERLAP_SEGUNDOS}s...")
                         time.sleep(OVERLAP_SEGUNDOS)
                         
                         # Detener viejo
-                        p_viejo = procesos[idx_problema]
-                        detener_grabacion_suave(p_viejo["proc"], nombre_partido, f"S{p_viejo['idx']}")
-                        p_viejo["estado"] = "dead"
+                        detener_grabacion_suave(proc_problema["proc"], nombre_partido, f"S{idx_problema}")
+                        proc_problema["estado"] = "dead"
                         
                         # Agregar nuevo
                         procesos.append({
                             "proc": proc_nuevo, "ruta": ruta_nuevo, "stream": nuevo_s,
-                            "idx": 100 + cambios_stream, "estado": "ok",
-                            "last_check": now, "last_size": 0, "stream_id": None
+                            "idx": 500 + cambios_stream, "estado": "ok",
+                            "last_check": now, "last_size": 0, 
+                            "stream_id": 500 + cambios_stream
                         })
                         
-                        procesos_vivos += 1
-                        log_partido(nombre_partido, f"   ✅ Transición completada")
+                        log_partido(nombre_partido, "   ✅ Reparación completada")
         
-        # D) Rescate TRIPLE si todos caen
+        # C) Health Check tradicional (tamaño de archivo)
+        procesos_vivos = 0
+        for p_obj in procesos:
+            if p_obj["estado"] == "dead":
+                continue
+            
+            if p_obj["proc"].poll() is None:
+                # Verificar crecimiento
+                try:
+                    tamaño_actual = obtener_tamanio_archivo(p_obj["ruta"])
+                    if tamaño_actual > p_obj["last_size"]:
+                        p_obj["last_size"] = tamaño_actual
+                        procesos_vivos += 1
+                    else:
+                        # Sin crecimiento
+                        if now - p_obj["last_check"] > 30:
+                            log_partido(nombre_partido, f"   ⚠️ S{p_obj['idx']} sin crecimiento 30s")
+                except:
+                    pass
+            else:
+                p_obj["estado"] = "dead"
+                log_partido(nombre_partido, f"   ☠️ S{p_obj['idx']} murió")
+        
+        # D) Rescate si todos caen
         if procesos_vivos == 0:
-            log_partido(nombre_partido, "🚨 RESCATE DE EMERGENCIA TRIPLE")
+            log_partido(nombre_partido, "🚨 RESCATE DE EMERGENCIA")
             
             nuevos = smart_selector.obtener_mejores_streams(fuentes_canal)
             if nuevos:
-                # Iniciar hasta 3 streams de emergencia
                 for i, nuevo_s in enumerate(nuevos[:3]):
                     cambios_stream += 1
-                    ruta_res = f"{ruta_base}_emergency{cambios_stream}_s{i}.mp4"
+                    ruta_res = f"{ruta_base}_emergency{cambios_stream}.mp4"
                     
-                    proc_res = iniciar_grabacion_ffmpeg_robusto(
-                        nuevo_s, ruta_res, nombre_partido, f" [EMERGENCY-{i}]", monitor
+                    proc_res = iniciar_grabacion_con_monitoreo(
+                        nuevo_s, ruta_res, nombre_partido, 
+                        f" [EMG-{i}]", health_manager
                     )
                     
                     if proc_res:
                         procesos.append({
                             "proc": proc_res, "ruta": ruta_res, "stream": nuevo_s,
-                            "idx": 200 + i, "estado": "ok", "last_check": now,
-                            "last_size": 0, "stream_id": None
+                            "idx": 300 + i, "estado": "ok", "last_check": now,
+                            "last_size": 0, "stream_id": 300 + i
                         })
                         procesos_vivos += 1
                 
                 log_partido(nombre_partido, f"✅ {procesos_vivos} streams de emergencia activos")
-            else:
-                log_partido(nombre_partido, "❌ No hay streams de respaldo disponibles")
         
-        # E) Log periódico de estado
+        # E) Log periódico
         if int(now) % 30 == 0:
-            log_partido(nombre_partido, 
-                f"📊 Estado: {procesos_vivos} streams activos, fase: {detector.fase_actual}")
+            log_partido(nombre_partido, f"📊 Estado: {procesos_vivos} streams, fase: {fase_actual}")
     
-    # Buffer final EXTENDIDO
+    # Detener monitoreo
+    health_manager.detener_todos()
+    
+    # Buffer final
     log_partido(nombre_partido, f"⏳ Buffer final {BUFFER_FIN_PARTIDO}s...")
     time.sleep(BUFFER_FIN_PARTIDO)
     
@@ -436,7 +503,6 @@ def grabar_con_vision_v3(fuentes_canal, ruta_base, nombre_partido,
         if p_obj["estado"] == "ok" and p_obj["proc"].poll() is None:
             detener_grabacion_suave(p_obj["proc"], nombre_partido, "final")
     
-    # Esperar que terminen de escribir
     time.sleep(5)
     
     # Recolectar archivos válidos
@@ -447,16 +513,14 @@ def grabar_con_vision_v3(fuentes_canal, ruta_base, nombre_partido,
     
     log_partido(nombre_partido, f"📦 {len(rutas_validas)} archivos válidos")
     
-    # Mostrar estadísticas
-    stats = detector.obtener_estadisticas()
-    log_partido(nombre_partido, f"📊 Estadísticas Vision AI:")
-    log_partido(nombre_partido, f"   Checks Gemini: {stats['checks_gemini']}")
-    log_partido(nombre_partido, f"   Checks Promiedos: {stats['checks_promiedos']}")
-    log_partido(nombre_partido, f"   Frames capturados: {stats['frames_capturados']}")
-    log_partido(nombre_partido, f"   Cache hit: {stats.get('tasa_cache_pct', 0):.0f}%")
+    # Reporte final
+    reporte = health_manager.obtener_reporte()
+    log_partido(nombre_partido, f"📊 Reporte de Salud:")
+    log_partido(nombre_partido, f"   Total checks: {len(reporte['streams'])}")
     
-    # Limpiar frames
-    detector.limpiar_recursos()
+    for sid, estado in reporte['streams'].items():
+        if estado['problemas']:
+            log_partido(nombre_partido, f"   S{sid}: {len(estado['problemas'])} problemas detectados")
     
     return rutas_validas
 
@@ -471,7 +535,6 @@ def seleccionar_mejor_video(rutas, nombre_partido):
     
     log_partido(nombre_partido, f"🏆 Mejor: {os.path.basename(mejor)} ({tamaño_mb:.1f} MB)")
     
-    # Eliminar otros
     for r in rutas:
         if r != mejor:
             try: 
@@ -481,47 +544,12 @@ def seleccionar_mejor_video(rutas, nombre_partido):
     
     return mejor
 
-def unir_videos_con_validacion(rutas_1t, rutas_2t, salida, nombre_partido, sync_mgr):
-    v1 = seleccionar_mejor_video(rutas_1t, nombre_partido)
-    v2 = seleccionar_mejor_video(rutas_2t, nombre_partido)
-    
-    if not v1 and not v2:
-        log_partido(nombre_partido, "❌ No hay videos para unir")
-        return False
-    
-    log_partido(nombre_partido, "🎬 Generando video final...")
-    
-    if v1 and v2:
-        lista = f"{CARPETA_TEMP}/{nombre_partido}_list.txt"
-        with open(lista, "w") as f:
-            f.write(f"file '{os.path.abspath(v1)}'\nfile '{os.path.abspath(v2)}'\n")
-        
-        subprocess.run(
-            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", lista, 
-             "-c", "copy", "-y", salida],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        
-        os.remove(lista)
-        
-        if os.path.exists(salida):
-            os.remove(v1)
-            os.remove(v2)
-    elif v1:
-        os.rename(v1, salida)
-    elif v2:
-        os.rename(v2, salida)
-    
-    return os.path.exists(salida)
+# ================= GESTOR PRINCIPAL v8 =================
 
-# ================= GESTOR PRINCIPAL v7 =================
-
-def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
+def gestionar_partido_v8(url_promiedos, url_sofascore, nombre_archivo, hora_inicio):
     """
-    Gestor optimizado para 0% pérdida con Vision AI v3
+    Gestor con backup de fuentes y monitoreo en tiempo real
     """
-    # Registrar partido activo (thread-safe)
     with _lock_partidos:
         if nombre_archivo in _partidos_activos:
             log_partido(nombre_archivo, "⚠️ Partido ya en proceso")
@@ -532,11 +560,11 @@ def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
         }
     
     try:
-        log_partido(nombre_archivo, f"📅 INICIANDO GESTIÓN OPTIMIZADA")
-        log_partido(nombre_archivo, f"   Modo: 0% PÉRDIDA GARANTIZADA")
+        log_partido(nombre_archivo, f"📅 INICIANDO GESTIÓN v8.0")
+        log_partido(nombre_archivo, f"   Monitoreo en tiempo real activado")
         
-        # 1. Metadata
-        meta = promiedos_client.obtener_metadata_partido(url_promiedos)
+        # Metadata con backup
+        meta, fuente = obtener_metadata_con_backup(url_promiedos, url_sofascore)
         if not meta:
             log_partido(nombre_archivo, "❌ No se pudo obtener metadata")
             return
@@ -546,11 +574,7 @@ def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
             log_partido(nombre_archivo, "❌ Sin canal compatible")
             return
         
-        # 2. CREAR DETECTOR v3
-        log_partido(nombre_archivo, "🔍 Inicializando Vision AI v3...")
-        detector = HybridStateDetectorV3(nombre_archivo, url_promiedos)
-        
-        # 3. Calcular hora con BUFFER DE INICIO
+        # Calcular hora
         ahora = datetime.now()
         h_match = datetime.strptime(hora_inicio, "%H:%M").replace(
             year=ahora.year, month=ahora.month, day=ahora.day
@@ -558,14 +582,12 @@ def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
         if h_match < ahora - timedelta(hours=4):
             h_match += timedelta(days=1)
         
-        # CRÍTICO: Restar buffer de inicio (3 minutos antes)
         hora_inicio_real = h_match - timedelta(seconds=BUFFER_INICIO_PARTIDO)
         
         log_partido(nombre_archivo, f"⏰ Hora programada: {h_match.strftime('%H:%M:%S')}")
         log_partido(nombre_archivo, f"   Inicio grabación: {hora_inicio_real.strftime('%H:%M:%S')}")
-        log_partido(nombre_archivo, f"   Buffer: -{BUFFER_INICIO_PARTIDO}s")
         
-        # 4. Pre-calentamiento (-5 min para análisis)
+        # Pre-calentamiento
         hora_precalentamiento = hora_inicio_real - timedelta(minutes=5)
         sec_wait = (hora_precalentamiento - datetime.now()).total_seconds()
         
@@ -576,29 +598,28 @@ def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
         log_partido(nombre_archivo, "⚡ Pre-calentando streams...")
         streams_precargados = smart_selector.obtener_mejores_streams(fuentes_canal)
         
-        # Esperar hasta inicio real (con buffer)
+        # Esperar hasta inicio
         sec_wait = (hora_inicio_real - datetime.now()).total_seconds()
         if sec_wait > 0:
             log_partido(nombre_archivo, f"⏳ Esperando {int(sec_wait/60)}m hasta inicio...")
             time.sleep(max(0, sec_wait))
         
-        # Actualizar estado
         with _lock_partidos:
             _partidos_activos[nombre_archivo]['estado'] = 'grabando'
         
-        # 5. GRABACIÓN OPTIMIZADA
+        # GRABACIÓN CON MONITOREO
         ruta_base = f"{CARPETA_LOCAL}/{nombre_archivo}_FULL"
         ruta_final = f"{CARPETA_LOCAL}/{nombre_archivo}_FULL.mp4"
         
-        log_partido(nombre_archivo, "🎬 INICIANDO GRABACIÓN (MODO 0% PÉRDIDA)")
+        log_partido(nombre_archivo, "🎬 INICIANDO GRABACIÓN CON MONITOREO")
         
-        rutas_generadas = grabar_con_vision_v3(
+        rutas_generadas = grabar_con_monitoreo_salud(
             fuentes_canal, ruta_base, nombre_archivo,
-            url_promiedos, detector, ["NO_JUGANDO", "FINAL"],
+            url_promiedos, url_sofascore, ["NO_JUGANDO", "FINAL", "ENTRETIEMPO"],
             streams_precargados=streams_precargados
         )
         
-        # 6. Procesar video
+        # Procesar video
         if rutas_generadas:
             mejor_video = seleccionar_mejor_video(rutas_generadas, nombre_archivo)
             if mejor_video:
@@ -624,7 +645,6 @@ def gestionar_partido_v7(url_promiedos, nombre_archivo, hora_inicio):
         log_partido(nombre_archivo, f"❌ Error crítico: {str(e)}")
     
     finally:
-        # Limpiar registro (thread-safe)
         with _lock_partidos:
             if nombre_archivo in _partidos_activos:
                 del _partidos_activos[nombre_archivo]
@@ -637,38 +657,44 @@ if __name__ == "__main__":
     setup_directorios()
     
     print("\n" + "="*70)
-    print("🚀 SISTEMA MAESTRO v7.0 - 0% PÉRDIDA GARANTIZADA")
+    print("🚀 SISTEMA MAESTRO v8.0 - MONITOREO EN TIEMPO REAL")
     print("="*70)
-    print("\n🎯 CARACTERÍSTICAS:")
-    print("   • Buffer inicio: -3min, fin: +5min")
-    print("   • Overlapping redundante: 60s")
-    print("   • Streams paralelos: 4")
-    print("   • Detección conservadora (prefiere grabar de más)")
-    print("   • Recuperación automática triple")
-    print("   • Limpieza automática de frames")
-    print("   • Soporte múltiples partidos simultáneos")
+    print("\n🎯 MEJORAS v8:")
+    print("   • IA SOLO valida contenido (no estado de partido)")
+    print("   • Estado: Promiedos → SofaScore (backup automático)")
+    print("   • Detección pantalla negra en tiempo real")
+    print("   • Detección congelamiento en tiempo real")
+    print("   • Recuperación automática ante problemas")
+    print("   • 5 streams paralelos (mayor redundancia)")
     print("="*70 + "\n")
     
-    # URLs de partidos (PUEDEN SER MÚLTIPLES)
-    URLS = [
-        "https://www.promiedos.com.ar/game/liverpool-vs-brighton/eefchcc",
+    # CONFIGURACIÓN DEL PARTIDO
+    PARTIDOS = [
+        {
+            'promiedos': "https://www.promiedos.com.ar/game/liverpool-vs-brighton/eefchcc",
+            'sofascore': "https://www.sofascore.com/es-la/football/match/liverpool-brighton-and-hove-albion/FsU#id:14025198"
+        }
     ]
     
     hilos = []
     
-    for url in URLS:
-        meta = promiedos_client.obtener_metadata_partido(url)
+    for partido in PARTIDOS:
+        meta, fuente = obtener_metadata_con_backup(
+            partido['promiedos'], 
+            partido['sofascore']
+        )
+        
         if meta:
             t = threading.Thread(
-                target=gestionar_partido_v7,
-                args=(url, meta['nombre'], meta['hora']),
+                target=gestionar_partido_v8,
+                args=(partido['promiedos'], partido['sofascore'], 
+                      meta['nombre'], meta['hora']),
                 daemon=False
             )
             t.start()
             hilos.append(t)
         else:
-            print(f"❌ No se pudo procesar: {url}")
-    
+            print(f"❌ No se pudo procesar partido") 
     for t in hilos:
         t.join()
     
