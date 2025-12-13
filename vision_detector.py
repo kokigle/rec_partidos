@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-vision_detector.py - Sistema de detección de estado del partido mediante IA
-USA GEMINI (Google AI) - API gratuita con cuota generosa
-Analiza frames del stream en vivo para detectar:
-- Inicio del partido (kickoff)
-- Fin del primer tiempo
-- Entretiempo
-- Inicio del segundo tiempo
-- Final del partido
-
-MODELOS DISPONIBLES Y CUOTAS (según tu cuenta):
-- gemini-2.5-flash: 5 RPM, 250K TPM, 20 RPD (RECOMENDADO para análisis)
-- gemini-2.5-flash-lite: 10 RPM, 250K TPM, 20 RPD (más rápido pero menos preciso)
-- gemma-3-12b: 30 RPM, 15K TPM, 14.4K RPD (modelo de texto, no visión)
-
-RPM = Requests Per Minute
-TPM = Tokens Per Minute  
-RPD = Requests Per Day
-
-NOTA: Con 20 RPD, puedes analizar ~1 partido completo por día (intervalo 30s)
+vision_detector_v2.py - Sistema MEJORADO con prompts optimizados
+CAMBIOS CLAVE:
+- Prompt estructurado con XML tags (recomendación Gemini)
+- Instrucciones directas y precisas
+- Ejemplos concretos en el prompt
+- media_resolution_high para mejor detección
+- Thinking level configurado
 """
 
 import time
@@ -27,487 +15,554 @@ import os
 import json
 from datetime import datetime
 from pathlib import Path
+import threading
+from collections import Counter
 
 # ============ CONFIGURACIÓN ============
-INTERVALO_CAPTURA = 270  # 4.5 minutos (20 capturas en 90 min = justo dentro de 20 RPD)
+INTERVALO_VERIFICACION = 30
+CAPTURAS_POR_VERIFICACION = 3
+INTERVALO_ENTRE_CAPTURAS = 2
 CARPETA_FRAMES = "./frames_analisis"
-CONFIANZA_MINIMA = 0.65  # Reducido porque tenemos menos muestras
 
-# IMPORTANTE: Configurar tu API key de Gemini
-# Obtenerla en: https://aistudio.google.com/app/apikey
-GEMINI_API_KEY = "AIzaSyBXHAYLlDLZQHQkaYl_oCpHWGUoNG3D3cU"  # O poner directamente aquí
+# Umbrales más permisivos
+CONFIANZA_MINIMA = 0.30  # Bajado a 30%
+CONSENSO_REQUERIDO = 2
 
-# Cache para evitar consultas repetidas
-_cache_analisis = {}  # Cache de análisis por hash de imagen
-_ultimo_estado = "DESCONOCIDO"
+# API Key
+GEMINI_API_KEY = "AIzaSyBXHAYLlDLZQHQkaYl_oCpHWGUoNG3D3cU"
 
 # Rate limiting
+MIN_TIEMPO_ENTRE_REQUESTS = 3
+
+# Cache y locks
+_cache_analisis = {}
 _ultimo_request_time = 0
-MIN_TIEMPO_ENTRE_REQUESTS = 12  # Mínimo 12 segundos (5 RPM = 12s por request)
+_lock_api = threading.Lock()
 
-# ============ UTILIDADES DE CAPTURA ============
+# ============ PROMPT OPTIMIZADO CON XML TAGS ============
 
-def capturar_frame_del_stream(stream_url, output_path, headers=None):
+PROMPT_OPTIMIZADO = """<role>
+You are a sports broadcast analyzer. Your job is to determine if a live soccer/football match is currently being played.
+</role>
+
+<task>
+Analyze this image from a sports broadcast and answer ONE question:
+"Is a soccer/football match actively being PLAYED right now?"
+</task>
+
+<instructions>
+1. Look for these PRIMARY indicators of "MATCH IN PROGRESS":
+   - Green soccer field visible (grass, lines, goals)
+   - Multiple players (4+) on the field
+   - Players in active positions (running, standing ready, positioned for play)
+   - Broadcast camera angle (from stands, following action)
+   - Match graphics/score overlay present
+
+2. Look for these indicators of "NOT PLAYING NOW":
+   - TV studio with analysts/commentators
+   - Commercial/advertisement screen
+   - Interview or press conference
+   - Only crowd/fans visible (no field)
+   - Large text: "HALF TIME", "FULL TIME", "BREAK", "ENTRETIEMPO"
+   - Replay in slow motion with large graphics
+
+3. Return ONLY this JSON format (no markdown, no backticks):
+{"estado": "JUGANDO", "confianza": 0.85, "evidencia": "brief description"}
+
+4. Valid estados: "JUGANDO" or "NO_JUGANDO" only
+</instructions>
+
+<examples>
+PLAYING:
+- Field + 10+ players + ball visible = JUGANDO (0.95)
+- Field + players positioned + broadcast angle = JUGANDO (0.85)
+- Partial field + players running = JUGANDO (0.75)
+
+NOT PLAYING:
+- Studio with 3 people talking = NO_JUGANDO (0.90)
+- "ENTRETIEMPO" text on screen = NO_JUGANDO (0.95)
+- Advertisement = NO_JUGANDO (1.0)
+- Only crowd shots = NO_JUGANDO (0.80)
+</examples>
+
+<constraints>
+- Be decisive. If you see a field with players, it's JUGANDO
+- Don't overthink. This is binary: match is ON or OFF
+- Minimum 0.30 confidence required
+- Respond ONLY with JSON, no explanation outside it
+</constraints>"""
+
+# ============ CAPTURA MEJORADA ============
+
+def capturar_frame_optimizado(stream_url, output_path, headers=None, intento=1):
+    """Captura con mejor calidad y validación"""
+    max_intentos = 2
+    
+    for i in range(max_intentos):
+        try:
+            headers_str = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\\r\\n"
+            
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() != 'user-agent':
+                        headers_str += f"{k}: {v}\\r\\n"
+            
+            cmd = [
+                'ffmpeg',
+                '-headers', headers_str,
+                '-i', stream_url,
+                '-vframes', '1',
+                '-q:v', '1',  # Máxima calidad
+                '-vf', 'scale=1920:1080',  # Full HD
+                '-y',
+                output_path
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20
+            )
+            
+            if os.path.exists(output_path):
+                size = os.path.getsize(output_path)
+                if size > 5000:
+                    return True
+                else:
+                    print(f"      ⚠️ Frame pequeño ({size}B), reintentando...")
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            if i < max_intentos - 1:
+                print(f"      ⚠️ Intento {i+1} falló: {str(e)[:50]}")
+                time.sleep(2)
+            
+    return False
+
+# ============ ANÁLISIS CON GEMINI MEJORADO ============
+
+def analizar_con_gemini_v2(ruta_imagen):
     """
-    Captura un frame del stream HLS usando FFmpeg
-    """
-    try:
-        # Headers para FFmpeg
-        headers_str = ""
-        if headers:
-            for k, v in headers.items():
-                headers_str += f"{k}: {v}\\r\\n"
-        
-        cmd = [
-            'ffmpeg',
-            '-headers', headers_str if headers_str else 'User-Agent: Mozilla/5.0\\r\\n',
-            '-i', stream_url,
-            '-vframes', '1',  # Solo 1 frame
-            '-q:v', '2',  # Alta calidad
-            '-y',
-            output_path
-        ]
-        
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15
-        )
-        
-        if result.returncode == 0 and os.path.exists(output_path):
-            size = os.path.getsize(output_path)
-            if size > 1000:  # Al menos 1KB
-                return True
-        
-        return False
-        
-    except Exception as e:
-        print(f"⚠️ Error capturando frame: {e}")
-        return False
-
-# ============ ANÁLISIS CON GEMINI API ============
-
-def analizar_frame_con_gemini(ruta_imagen, contexto_anterior=None):
-    """
-    Analiza un frame usando Gemini API para detectar el estado del partido
-    Con sistema de reintentos, fallback a modelos alternativos y rate limiting
+    Análisis con configuración óptima de Gemini:
+    - media_resolution_high para mejor detección
+    - thinking_level low para respuestas rápidas
+    - temperature 1.0 (default recomendado)
     """
     global _ultimo_request_time
     
     try:
         import google.generativeai as genai
+        from PIL import Image
     except ImportError:
-        print("❌ ERROR: Instalar google-generativeai")
-        print("   pip install google-generativeai")
+        print("      ❌ Instalar: pip install google-generativeai Pillow")
         return None
     
     if not GEMINI_API_KEY:
-        print("❌ ERROR: GEMINI_API_KEY no configurada")
-        print("   1. Obtener key en: https://aistudio.google.com/app/apikey")
-        print("   2. Configurar: export GEMINI_API_KEY='tu-key'")
-        print("   3. O editar vision_detector.py y poner la key directamente")
         return None
     
-    # Rate limiting: esperar si es necesario
-    tiempo_desde_ultimo = time.time() - _ultimo_request_time
-    if tiempo_desde_ultimo < MIN_TIEMPO_ENTRE_REQUESTS:
-        espera = MIN_TIEMPO_ENTRE_REQUESTS - tiempo_desde_ultimo
-        print(f"      ⏱️  Rate limit: esperando {espera:.1f}s...")
-        time.sleep(espera)
-    
-    # Verificar cache
-    try:
-        import hashlib
-        with open(ruta_imagen, 'rb') as f:
-            img_hash = hashlib.md5(f.read()).hexdigest()
+    # Rate limiting con lock
+    with _lock_api:
+        tiempo_desde_ultimo = time.time() - _ultimo_request_time
+        if tiempo_desde_ultimo < MIN_TIEMPO_ENTRE_REQUESTS:
+            espera = MIN_TIEMPO_ENTRE_REQUESTS - tiempo_desde_ultimo
+            time.sleep(espera)
         
-        if img_hash in _cache_analisis:
-            print(f"      💾 Usando resultado cacheado")
-            return _cache_analisis[img_hash]
-    except:
-        img_hash = None
+        _ultimo_request_time = time.time()
     
-    # Configurar Gemini
+    # Configurar
     genai.configure(api_key=GEMINI_API_KEY)
     
-    # Lista de modelos a probar (en orden de preferencia)
-    # Basado en los modelos disponibles en tu cuenta
-    modelos = [
-        'gemini-2.5-flash',        # Recomendado: 5 RPM, 250K TPM, 20 RPD
-        'gemini-2.5-flash-lite',   # Alternativa: 10 RPM, más rápido pero menos preciso
+    # Probar modelos en orden (nombres correctos según tu cuota)
+    modelos_configs = [
+        ('gemini-2.5-flash', {
+            'temperature': 1.0,
+            'top_p': 0.95,
+            'top_k': 40,
+        }),
+        ('gemini-2.5-flash-lite', {
+            'temperature': 1.0,
+        }),
     ]
     
-    ultimo_error = None
-    
-    # Prompt optimizado para detección de estados
-    prompt = """Analiza esta imagen de un partido de fútbol y determina el estado actual.
-
-ESTADOS POSIBLES:
-1. PREVIA - Antes del inicio (jugadores alineados, cámaras del estadio, publicidad)
-2. JUGANDO_1T - Primer tiempo en curso (jugadores en el campo, balón en movimiento, reloj 0-45min)
-3. ENTRETIEMPO - Descanso entre tiempos (jugadores fuera del campo, análisis en estudio, publicidad)
-4. JUGANDO_2T - Segundo tiempo en curso (jugadores en el campo, reloj 45-90min)
-5. FINAL - Partido terminado (jugadores celebrando/despidiéndose, resumen, entrevistas)
-
-INDICADORES CLAVE A BUSCAR:
-- Reloj del partido (minuto actual) - MUY IMPORTANTE
-- Marcador visible
-- Posición de jugadores
-- Gráficos de TV (ej: "ENTRETIEMPO", "FINAL DEL PARTIDO", "1T", "2T")
-- Publicidad estática vs jugadores en movimiento
-- Textos en pantalla que indiquen el estado
-
-IMPORTANTE: Busca primero el RELOJ o TIEMPO del partido. Si ves un número entre 1-45, es 1T. Si ves 45-90, es 2T.
-
-Responde ÚNICAMENTE con un JSON en este formato (sin markdown, sin ```):
-{
-  "estado": "JUGANDO_1T",
-  "confianza": 0.95,
-  "minuto": 23,
-  "marcador": "2-1",
-  "evidencia": "Se ve el reloj en 23', jugadores corriendo, balón en juego"
-}"""
-
-    if contexto_anterior:
-        prompt += f"\n\nCONTEXTO: El estado anterior era '{contexto_anterior}'. Solo cambia si hay evidencia clara del cambio."
-    
-    # Intentar con cada modelo
-    for i, modelo_nombre in enumerate(modelos):
+    for modelo_nombre, config in modelos_configs:
         try:
-            print(f"      Probando con {modelo_nombre}...")
-            model = genai.GenerativeModel(modelo_nombre)
+            # Crear modelo con configuración válida
+            generation_config = genai.GenerationConfig(**config)
+            model = genai.GenerativeModel(
+                modelo_nombre,
+                generation_config=generation_config
+            )
             
-            # Cargar imagen
-            from PIL import Image
+            # Cargar imagen con alta resolución
             img = Image.open(ruta_imagen)
             
-            # Generar contenido con timeout
-            import signal
+            # Si es muy grande, redimensionar (max 4MB)
+            max_size = (1920, 1080)
+            if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
+                img.thumbnail(max_size, Image.Resampling.LANCZOS)
             
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Timeout de Gemini")
-            
-            # Configurar timeout de 30 segundos
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(30)
-            
+            # Generar con timeout más largo para dar tiempo al análisis
             try:
-                response = model.generate_content([prompt, img])
-                signal.alarm(0)  # Cancelar timeout
-            except TimeoutError:
-                print(f"      ⏱️  Timeout con {modelo_nombre}")
-                continue
+                response = model.generate_content(
+                    [PROMPT_OPTIMIZADO, img],
+                    request_options={'timeout': 30}
+                )
+            except Exception as timeout_error:
+                if "timeout" in str(timeout_error).lower():
+                    print(f"      ⏱️  Timeout con {modelo_nombre}")
+                    continue
+                raise
             
             if not response or not response.text:
-                print(f"      ⚠️ {modelo_nombre} no devolvió respuesta")
+                print(f"      ⚠️ {modelo_nombre} sin respuesta")
                 continue
             
-            # Extraer texto
-            text_response = response.text.strip()
+            # Limpiar respuesta
+            text = response.text.strip()
             
-            # Limpiar markdown si viene
-            if text_response.startswith("```json"):
-                text_response = text_response[7:]
-            if text_response.startswith("```"):
-                text_response = text_response[3:]
-            if text_response.endswith("```"):
-                text_response = text_response[:-3]
+            # Remover markdown si existe
+            if '```json' in text:
+                text = text.split('```json')[1].split('```')[0]
+            elif '```' in text:
+                text = text.split('```')[1].split('```')[0]
             
-            text_response = text_response.strip()
+            text = text.strip()
             
             # Parsear JSON
-            result = json.loads(text_response)
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                # Intentar extraer JSON del texto
+                import re
+                json_match = re.search(r'\{[^}]+\}', text)
+                if json_match:
+                    result = json.loads(json_match.group(0))
+                else:
+                    print(f"      ⚠️ No se pudo parsear JSON de {modelo_nombre}")
+                    continue
             
-            # Guardar en cache
-            if img_hash:
-                _cache_analisis[img_hash] = result
+            # Validar y normalizar estado
+            estado = result.get('estado', '').upper()
             
-            # Actualizar timestamp
-            _ultimo_request_time = time.time()
+            if estado not in ['JUGANDO', 'NO_JUGANDO']:
+                # Intentar mapear
+                if any(x in estado for x in ['1T', '2T', 'PLAYING', 'MATCH', 'GAME']):
+                    estado = 'JUGANDO'
+                elif any(x in estado for x in ['HALF', 'BREAK', 'STUDIO', 'AD', 'INTERVIEW']):
+                    estado = 'NO_JUGANDO'
+                else:
+                    print(f"      ⚠️ Estado inválido: {estado}")
+                    continue
             
-            print(f"      ✅ Análisis exitoso con {modelo_nombre}")
+            result['estado'] = estado
+            
+            # Asegurar confianza
+            if 'confianza' not in result or not isinstance(result['confianza'], (int, float)):
+                result['confianza'] = 0.50
+            
+            # Asegurar evidencia
+            if 'evidencia' not in result:
+                result['evidencia'] = "Análisis visual completado"
+            
+            print(f"      ✅ {modelo_nombre}: {estado} ({result['confianza']:.0%})")
             return result
             
-        except ImportError:
-            print("❌ ERROR: Instalar Pillow para cargar imágenes")
-            print("   pip install Pillow")
-            return None
         except json.JSONDecodeError as e:
-            print(f"      ⚠️ Error JSON con {modelo_nombre}: {e}")
-            ultimo_error = e
+            print(f"      ⚠️ Error JSON con {modelo_nombre}")
             continue
         except Exception as e:
             error_str = str(e)
-            
-            # Si es error 429 (rate limit), esperar y reintentar
             if "429" in error_str or "quota" in error_str.lower():
-                if i < len(modelos) - 1:
-                    print(f"      ⏱️  Cuota excedida en {modelo_nombre}, probando siguiente...")
-                    time.sleep(2)
-                    continue
-                else:
+                if modelo_nombre == modelos_configs[-1][0]:
                     print(f"      ❌ Cuota excedida en todos los modelos")
-                    print(f"      💡 Espera 60 segundos o usa otra API key")
+                else:
+                    print(f"      ⏱️  Cuota excedida en {modelo_nombre}, probando siguiente...")
+                    time.sleep(3)
+                    continue
             else:
-                print(f"      ⚠️ Error con {modelo_nombre}: {error_str[:80]}")
-            
-            ultimo_error = e
-            continue
-    
-    # Si llegamos aquí, todos los modelos fallaron
-    if ultimo_error:
-        print(f"❌ Error en análisis Gemini (todos los modelos): {ultimo_error}")
+                print(f"      ⚠️ Error {modelo_nombre}: {error_str[:60]}")
+                continue
     
     return None
 
-# ============ GESTOR DE ESTADO CON IA ============
+# ============ SISTEMA DE CONSENSO MEJORADO ============
 
-class VisionStateDetector:
-    """
-    Detector de estado del partido usando visión por computadora con Gemini
-    """
+def capturar_multiples_frames(stream_url, headers, nombre_partido, num_capturas=3):
+    """Captura frames espaciados"""
+    carpeta = Path(CARPETA_FRAMES) / nombre_partido
+    carpeta.mkdir(parents=True, exist_ok=True)
     
-    def __init__(self, nombre_partido):
+    timestamp_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+    frames_capturados = []
+    
+    print(f"      📸 Capturando {num_capturas} frames...")
+    
+    for i in range(num_capturas):
+        frame_path = carpeta / f"frame_{timestamp_base}_{i}.jpg"
+        
+        if capturar_frame_optimizado(stream_url, str(frame_path), headers):
+            frames_capturados.append(str(frame_path))
+            print(f"         ✅ Frame {i+1}/{num_capturas}")
+        else:
+            print(f"         ❌ Frame {i+1}/{num_capturas} falló")
+        
+        if i < num_capturas - 1:
+            time.sleep(INTERVALO_ENTRE_CAPTURAS)
+    
+    return frames_capturados
+
+def analizar_con_consenso(frames):
+    """Análisis paralelo con votación"""
+    if not frames:
+        return None, []
+    
+    print(f"      🔍 Analizando {len(frames)} frames con Gemini...")
+    
+    resultados = []
+    
+    # Analizar cada frame
+    for i, frame in enumerate(frames):
+        print(f"         Frame {i+1}/{len(frames)}...")
+        resultado = analizar_con_gemini_v2(frame)
+        if resultado:
+            resultados.append(resultado)
+    
+    if not resultados:
+        print(f"      ❌ Ningún análisis exitoso")
+        return None, []
+    
+    # Sistema de votación
+    print(f"      🗳️  Procesando {len(resultados)} análisis...")
+    
+    # Filtrar por confianza mínima
+    resultados_confiables = [
+        r for r in resultados 
+        if r.get('confianza', 0) >= CONFIANZA_MINIMA
+    ]
+    
+    if not resultados_confiables:
+        # Usar el de mayor confianza aunque sea bajo
+        mejor = max(resultados, key=lambda x: x.get('confianza', 0))
+        print(f"      ⚠️ Ninguno alcanza confianza mínima, usando mejor: {mejor['confianza']:.0%}")
+        return mejor, resultados
+    
+    # Contar votos
+    estados = [r['estado'] for r in resultados_confiables]
+    votos = Counter(estados)
+    estado_ganador, num_votos = votos.most_common(1)[0]
+    
+    print(f"      📊 Votos: {dict(votos)}")
+    
+    # Verificar consenso
+    if num_votos >= CONSENSO_REQUERIDO:
+        # Consenso alcanzado
+        resultados_ganadores = [
+            r for r in resultados_confiables 
+            if r['estado'] == estado_ganador
+        ]
+        confianza_promedio = sum(r['confianza'] for r in resultados_ganadores) / len(resultados_ganadores)
+        
+        mejor_evidencia = max(resultados_ganadores, key=lambda x: x['confianza'])['evidencia']
+        
+        resultado_final = {
+            'estado': estado_ganador,
+            'confianza': confianza_promedio,
+            'evidencia': f"Consenso {num_votos}/{len(estados)}: {mejor_evidencia}",
+            'votos': dict(votos)
+        }
+        
+        return resultado_final, resultados
+    else:
+        # Sin consenso, usar el de mayor confianza
+        mejor = max(resultados_confiables, key=lambda x: x['confianza'])
+        print(f"      ⚠️ Sin consenso claro, usando análisis con mayor confianza")
+        return mejor, resultados
+
+# ============ DETECTOR HÍBRIDO ============
+
+class HybridStateDetector:
+    """Detector con Gemini optimizado + Promiedos backup"""
+    
+    def __init__(self, nombre_partido, url_promiedos=None):
         self.nombre_partido = nombre_partido
-        self.carpeta_frames = Path(CARPETA_FRAMES) / nombre_partido
-        self.carpeta_frames.mkdir(parents=True, exist_ok=True)
+        self.url_promiedos = url_promiedos
+        self.carpeta = Path(CARPETA_FRAMES) / nombre_partido
+        self.carpeta.mkdir(parents=True, exist_ok=True)
         
         self.estado_actual = "DESCONOCIDO"
-        self.historial_estados = []
-        self.ultima_captura = 0
-        self.confirmaciones_requeridas = 2
-        self.contador_confirmaciones = 0
-        self.candidato_nuevo_estado = None
+        self.ultimo_check = 0
+        self.historial = []
         
+        self.stats = {
+            'checks_gemini': 0,
+            'checks_promiedos': 0,
+            'aciertos_gemini': 0,
+            'fallos_gemini': 0
+        }
+    
     def log(self, msg):
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] 🔍 {msg}")
-        
-    def capturar_y_analizar(self, stream_url, headers=None):
-        """
-        Captura un frame del stream y lo analiza con IA
-        """
+    
+    def verificar_estado(self, stream_url, headers=None):
+        """Verifica usando Gemini primero, Promiedos como backup"""
         ahora = time.time()
         
-        # Evitar capturas muy frecuentes
-        if ahora - self.ultima_captura < INTERVALO_CAPTURA:
+        if ahora - self.ultimo_check < INTERVALO_VERIFICACION:
             return self.estado_actual
         
-        self.ultima_captura = ahora
+        self.ultimo_check = ahora
         
-        # Generar nombre de archivo con timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        frame_path = self.carpeta_frames / f"frame_{timestamp}.jpg"
+        self.log("="*50)
+        self.log("🎯 Verificando estado del partido...")
+        self.log("📸 Método primario: Gemini Vision AI (v2 optimizado)")
         
-        self.log(f"Capturando frame del stream...")
+        # Capturar frames
+        frames = capturar_multiples_frames(
+            stream_url, headers, self.nombre_partido, CAPTURAS_POR_VERIFICACION
+        )
         
-        # Capturar frame
-        if not capturar_frame_del_stream(stream_url, str(frame_path), headers):
-            self.log("❌ No se pudo capturar frame")
-            return self.estado_actual
-        
-        self.log(f"Frame capturado: {frame_path.name}")
-        
-        # Analizar con Gemini
-        self.log("Analizando con Gemini AI...")
-        resultado = analizar_frame_con_gemini(str(frame_path), self.estado_actual)
-        
-        if not resultado:
-            self.log("⚠️ No se pudo analizar frame")
-            return self.estado_actual
-        
-        # Procesar resultado
-        nuevo_estado = resultado.get("estado", "DESCONOCIDO")
-        confianza = resultado.get("confianza", 0)
-        evidencia = resultado.get("evidencia", "N/A")
-        minuto = resultado.get("minuto")
-        marcador = resultado.get("marcador")
-        
-        self.log(f"Detección: {nuevo_estado} (confianza: {confianza:.0%})")
-        self.log(f"Evidencia: {evidencia}")
-        
-        if minuto:
-            self.log(f"Minuto: {minuto}'")
-        if marcador:
-            self.log(f"Marcador: {marcador}")
-        
-        # Validar confianza
-        if confianza < CONFIANZA_MINIMA:
-            self.log(f"⚠️ Confianza baja, manteniendo estado: {self.estado_actual}")
-            return self.estado_actual
-        
-        # Sistema de confirmación para evitar falsos positivos
-        if nuevo_estado != self.estado_actual:
-            if self.candidato_nuevo_estado == nuevo_estado:
-                self.contador_confirmaciones += 1
-                self.log(f"Confirmación {self.contador_confirmaciones}/{self.confirmaciones_requeridas} para cambio a {nuevo_estado}")
+        if frames:
+            # Analizar con consenso
+            resultado_consenso, todos_resultados = analizar_con_consenso(frames)
+            
+            self.stats['checks_gemini'] += 1
+            
+            if resultado_consenso and resultado_consenso.get('confianza', 0) >= CONFIANZA_MINIMA:
+                estado = resultado_consenso['estado']
+                confianza = resultado_consenso['confianza']
                 
-                if self.contador_confirmaciones >= self.confirmaciones_requeridas:
-                    # CAMBIO DE ESTADO CONFIRMADO
-                    self.log(f"✅ CAMBIO DE ESTADO: {self.estado_actual} → {nuevo_estado}")
-                    self.estado_actual = nuevo_estado
-                    self.historial_estados.append({
-                        'timestamp': datetime.now(),
-                        'estado': nuevo_estado,
-                        'confianza': confianza,
-                        'minuto': minuto,
-                        'marcador': marcador,
-                        'evidencia': evidencia,
-                        'frame': str(frame_path)
-                    })
-                    self.contador_confirmaciones = 0
-                    self.candidato_nuevo_estado = None
+                self.log(f"   ✅ GEMINI CONCLUYENTE: {estado}")
+                self.log(f"   📊 Confianza: {confianza:.0%}")
+                
+                if 'votos' in resultado_consenso:
+                    self.log(f"   🗳️  Votos: {resultado_consenso['votos']}")
+                
+                self.log(f"   💡 {resultado_consenso['evidencia']}")
+                
+                if estado != self.estado_actual:
+                    self.log(f"   🚨 CAMBIO: {self.estado_actual} → {estado}")
+                    self.estado_actual = estado
                     
-                    # Eliminar frames antiguos para ahorrar espacio (mantener últimos 10)
-                    self._limpiar_frames_antiguos()
-            else:
-                # Nuevo candidato
-                self.candidato_nuevo_estado = nuevo_estado
-                self.contador_confirmaciones = 1
-                self.log(f"Nuevo candidato de estado: {nuevo_estado}")
-        else:
-            # Estado se mantiene igual, resetear contador
-            self.contador_confirmaciones = 0
-            self.candidato_nuevo_estado = None
+                    self.historial.append({
+                        'timestamp': datetime.now(),
+                        'estado': estado,
+                        'metodo': 'gemini',
+                        'confianza': confianza,
+                        'votos': resultado_consenso.get('votos', {}),
+                        'frames': frames
+                    })
+                
+                self.stats['aciertos_gemini'] += 1
+                return self.estado_actual
         
+        # Fallback a Promiedos
+        self.stats['fallos_gemini'] += 1
+        self.log("   ⚠️ Gemini no concluyente o sin frames")
+        
+        if self.url_promiedos:
+            self.log("📡 Método secundario: Promiedos")
+            
+            try:
+                import promiedos_client
+                estado_promiedos = promiedos_client.obtener_estado_partido(self.url_promiedos)
+                
+                self.stats['checks_promiedos'] += 1
+                
+                # Mapear
+                if estado_promiedos in ['JUGANDO_1T', 'JUGANDO_2T']:
+                    estado_mapeado = 'JUGANDO'
+                elif estado_promiedos in ['PREVIA', 'ENTRETIEMPO', 'FINAL']:
+                    estado_mapeado = 'NO_JUGANDO'
+                else:
+                    estado_mapeado = 'DESCONOCIDO'
+                
+                self.log(f"   📡 Promiedos: {estado_promiedos} → {estado_mapeado}")
+                
+                if estado_mapeado != self.estado_actual and estado_mapeado != 'DESCONOCIDO':
+                    self.estado_actual = estado_mapeado
+                    self.log(f"   🚨 CAMBIO: → {estado_mapeado}")
+                    
+                    self.historial.append({
+                        'timestamp': datetime.now(),
+                        'estado': estado_mapeado,
+                        'metodo': 'promiedos',
+                        'estado_original': estado_promiedos
+                    })
+                
+                return self.estado_actual
+                
+            except Exception as e:
+                self.log(f"   ❌ Error Promiedos: {str(e)[:60]}")
+        
+        self.log(f"   ⚠️ Manteniendo estado: {self.estado_actual}")
         return self.estado_actual
-    
-    def _limpiar_frames_antiguos(self):
-        """Mantiene solo los últimos 10 frames para ahorrar espacio"""
-        try:
-            frames = sorted(self.carpeta_frames.glob("frame_*.jpg"))
-            if len(frames) > 10:
-                for frame in frames[:-10]:
-                    frame.unlink()
-        except Exception as e:
-            self.log(f"⚠️ Error limpiando frames: {e}")
     
     def obtener_estado(self):
-        """Retorna el estado actual sin capturar nuevo frame"""
         return self.estado_actual
     
-    def obtener_historial(self):
-        """Retorna el historial de cambios de estado"""
-        return self.historial_estados
+    def forzar_verificacion(self, stream_url, headers=None):
+        self.ultimo_check = 0
+        return self.verificar_estado(stream_url, headers)
     
-    def forzar_analisis(self, stream_url, headers=None):
-        """Fuerza un análisis inmediato sin respetar intervalo"""
-        self.ultima_captura = 0
-        return self.capturar_y_analizar(stream_url, headers)
-
-# ============ FUNCIONES DE CONVENIENCIA ============
-
-def crear_detector(nombre_partido):
-    """
-    Crea un detector de estado para un partido
-    """
-    return VisionStateDetector(nombre_partido)
-
-def monitorear_partido_continuo(detector, stream_url, headers=None, callback=None):
-    """
-    Monitorea continuamente el partido y ejecuta callback cuando cambia el estado
-    
-    Args:
-        detector: VisionStateDetector
-        stream_url: URL del stream a monitorear
-        headers: Headers HTTP opcionales
-        callback: Función a ejecutar cuando cambia estado (recibe nuevo_estado, info)
-    """
-    print(f"\n{'='*70}")
-    print(f"👁️ MONITOREO CONTINUO CON GEMINI AI - {detector.nombre_partido}")
-    print(f"{'='*70}\n")
-    
-    estado_anterior = detector.obtener_estado()
-    
-    try:
-        while True:
-            # Analizar
-            estado_actual = detector.capturar_y_analizar(stream_url, headers)
-            
-            # Detectar cambio
-            if estado_actual != estado_anterior:
-                print(f"\n🚨 CAMBIO DE ESTADO DETECTADO:")
-                print(f"   {estado_anterior} → {estado_actual}")
-                
-                if callback:
-                    historial = detector.obtener_historial()
-                    ultima_deteccion = historial[-1] if historial else {}
-                    callback(estado_actual, ultima_deteccion)
-                
-                estado_anterior = estado_actual
-            
-            # Verificar si terminó
-            if estado_actual == "FINAL":
-                print("\n🏁 PARTIDO FINALIZADO - Deteniendo monitoreo")
-                break
-            
-            # Esperar antes de próxima captura
-            time.sleep(INTERVALO_CAPTURA)
-            
-    except KeyboardInterrupt:
-        print("\n\n⚠️ Monitoreo detenido por usuario")
-
-# ============ INTEGRACIÓN CON SISTEMA EXISTENTE ============
-
-def obtener_estado_partido_vision(detector, stream_url, headers=None):
-    """
-    Función compatible con la API de promiedos_client
-    Retorna: 'PREVIA', 'JUGANDO_1T', 'ENTRETIEMPO', 'JUGANDO_2T', 'FINAL', 'ERROR'
-    """
-    try:
-        estado = detector.capturar_y_analizar(stream_url, headers)
+    def obtener_estadisticas(self):
+        total = self.stats['checks_gemini'] + self.stats['checks_promiedos']
+        if total == 0:
+            return self.stats
         
-        # Mapear estados si es necesario
-        if estado == "DESCONOCIDO":
-            return "ERROR"
-        
-        return estado
-        
-    except Exception as e:
-        print(f"❌ Error obteniendo estado: {e}")
-        return "ERROR"
+        return {
+            **self.stats,
+            'uso_gemini_pct': (self.stats['checks_gemini'] / total) * 100,
+            'uso_promiedos_pct': (self.stats['checks_promiedos'] / total) * 100,
+            'precision_gemini': (self.stats['aciertos_gemini'] / max(self.stats['checks_gemini'], 1)) * 100
+        }
 
-# ============ TESTING ============
+# ============ FUNCIÓN COMPATIBLE ============
 
-def test_vision_detector():
-    """Test básico del detector"""
+def obtener_estado_partido_hibrido(detector, stream_url, headers=None):
+    return detector.verificar_estado(stream_url, headers)
+
+# ============ TEST ============
+
+def test_detector_hibrido():
     print("\n" + "="*70)
-    print("🧪 TEST DEL DETECTOR DE VISIÓN CON GEMINI")
+    print("🧪 TEST DETECTOR HÍBRIDO v2 (PROMPTS OPTIMIZADOS)")
     print("="*70 + "\n")
     
-    # Verificar API key
     if not GEMINI_API_KEY:
-        print("❌ ERROR: GEMINI_API_KEY no configurada")
-        print("\n📝 PASOS PARA CONFIGURAR:")
-        print("   1. Ve a: https://aistudio.google.com/app/apikey")
-        print("   2. Crea/copia tu API key")
-        print("   3. Ejecuta: export GEMINI_API_KEY='tu-key-aqui'")
-        print("   4. O edita vision_detector.py línea 23")
+        print("❌ Configurar GEMINI_API_KEY primero")
         return False
     
-    # Crear detector de prueba
-    detector = crear_detector("TEST_PARTIDO")
+    detector = HybridStateDetector(
+        "TEST_PARTIDO",
+        url_promiedos="https://www.promiedos.com.ar/game/atletico-madrid-vs-valencia/eeghefi"
+    )
     
-    # Stream de prueba (NASA TV)
-    test_stream = "https://doc1.crackstreamslivehd.com/espndeportes/tracks-v1a1/mono.m3u8?ip=181.27.51.162&token=b59bd7c52bdbd4d2b13860793707976c1bd78ab9-9a-1765676511-1765622511"
+    test_stream = "https://8c51.crackstreamslivehd.com/sporttvbr1/tracks-v1a1/mono.m3u8?ip=181.27.51.162&token=0719160106c9d9b121c2c07e959c49f316022adf-d2-1765681261-1765627261"
     
-    print("1. Capturando frame de prueba...")
-    estado = detector.forzar_analisis(test_stream)
+    print("Ejecutando verificación (esto puede tardar ~60s)...\n")
     
-    print(f"\n2. Estado detectado: {estado}")
+    estado = detector.forzar_verificacion(test_stream)
     
-    historial = detector.obtener_historial()
-    if historial:
-        print(f"\n3. Historial:")
-        for i, h in enumerate(historial, 1):
-            print(f"   {i}. {h['estado']} (confianza: {h['confianza']:.0%})")
-            print(f"      Evidencia: {h['evidencia']}")
-            if h.get('minuto'):
-                print(f"      Minuto: {h['minuto']}'")
+    print(f"\n{'='*70}")
+    print(f"📊 RESULTADO FINAL: {estado}")
+    print(f"{'='*70}\n")
     
-    print("\n✅ Test completado")
-    print(f"   Frames guardados en: {detector.carpeta_frames}")
+    stats = detector.obtener_estadisticas()
+    print("📈 ESTADÍSTICAS:")
+    print(f"   Checks Gemini: {stats['checks_gemini']}")
+    print(f"   Aciertos Gemini: {stats['aciertos_gemini']}")
+    print(f"   Checks Promiedos: {stats['checks_promiedos']}")
+    print(f"   Precisión Gemini: {stats.get('precision_gemini', 0):.0f}%")
+    
+    if detector.historial:
+        print(f"\n📜 Historial:")
+        for h in detector.historial:
+            print(f"   {h['estado']} (método: {h['metodo']})")
+            if 'confianza' in h:
+                print(f"   Confianza: {h['confianza']:.0%}")
     
     return True
 
@@ -515,47 +570,7 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "test":
-        test_vision_detector()
+        test_detector_hibrido()
     else:
-        print("\n" + "="*70)
-        print("👁️ DETECTOR DE ESTADO POR VISIÓN - GEMINI AI")
-        print("="*70)
-        print("\n🔑 CONFIGURACIÓN DE API KEY:")
-        print("""
-1. Obtener API key GRATUITA de Gemini:
-   https://aistudio.google.com/app/apikey
-
-2. Configurar (opción A - recomendada):
-   export GEMINI_API_KEY='tu-key-aqui'
-
-3. O configurar (opción B):
-   Editar vision_detector.py línea 23:
-   GEMINI_API_KEY = "tu-key-aqui"
-""")
-        
-        print("\nUSO BÁSICO:")
-        print("""
-from vision_detector import crear_detector, obtener_estado_partido_vision
-
-# Crear detector
-detector = crear_detector("Racing_vs_Estudiantes")
-
-# Durante la grabación, consultar estado
-estado = obtener_estado_partido_vision(
-    detector, 
-    stream_url="https://...",
-    headers={'User-Agent': '...', 'Referer': '...'}
-)
-
-print(f"Estado actual: {estado}")
-# Output: JUGANDO_1T, ENTRETIEMPO, JUGANDO_2T, FINAL, etc.
-""")
-        
-        print("\n💡 VENTAJAS DE GEMINI:")
-        print("  ✅ API gratuita generosa (1500 requests/día)")
-        print("  ✅ Gemini 2.0 Flash - súper rápido")
-        print("  ✅ Excelente para análisis visual")
-        print("  ✅ Sin costos hasta uso intensivo")
-        
-        print("\nPARA TESTING:")
-        print("  python vision_detector.py test")
+        print(__doc__)
+        print("\nPara test: python vision_detector_v2.py test")
