@@ -1,5 +1,5 @@
-./partidos_grabados/
-./__pycache__/
-./venv/
-./logs/
-./temp_segments/
+partidos_grabados/
+__pycache__/
+venv/
+logs/
+temp_segments/
